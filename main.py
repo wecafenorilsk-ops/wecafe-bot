@@ -7,8 +7,10 @@ WeCafe Cleaning & Shift Bot (Telegram)
 - End-of-slot finance report + 1-2 receipt photos
 - Reminders every N minutes + "Косяк снял..." after overdue
 - Daily summary at END_OF_DAY_TIME to CONTROL group
+
 Python: 3.12+
 PTB: python-telegram-bot[job-queue]==21.6
+Render: Web Service needs open port -> built-in health server on $PORT
 """
 
 import os
@@ -43,9 +45,9 @@ from telegram.ext import (
     filters,
 )
 
-
 # -------------------- Render Health Server (IMPORTANT) --------------------
-# Render Web Service требует открытый порт. Этот мини-сервер отвечает "ok" на любой GET.
+# Render Web Service обязательно должен увидеть открытый порт.
+# Этот мини-сервер отвечает "ok" на любой GET запрос.
 def _start_health_server():
     port = int(os.getenv("PORT", "10000"))
 
@@ -57,12 +59,11 @@ def _start_health_server():
             self.wfile.write(b"ok")
 
         def log_message(self, format, *args):
-            return  # не засоряем логи
+            return  # чтобы не засорять логи
 
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 threading.Thread(target=_start_health_server, daemon=True).start()
-# -------------------------------------------------------------------------
 
 # -------------------- Logging --------------------
 logging.basicConfig(
@@ -97,11 +98,6 @@ except Exception as e:
 END_OF_DAY_TIME = os.getenv("END_OF_DAY_TIME", "22:30").strip() or "22:30"
 REMINDER_INTERVAL_MIN = int(os.getenv("REMINDER_INTERVAL_MIN", "30").strip() or "30")
 
-# Автоактивация (ограниченный доступ) только в это окно времени (Норильск)
-AUTO_APPROVE_START = os.getenv("AUTO_APPROVE_START", "09:00").strip() or "09:00"
-AUTO_APPROVE_END = os.getenv("AUTO_APPROVE_END", "15:00").strip() or "15:00"
-
-
 POINTS = ["69 Параллель", "Арена", "Кафе Музей"]
 
 # Рабочие часы точек (Норильск)
@@ -134,16 +130,6 @@ def parse_hhmm(s: str) -> dtime:
     hh, mm = s.split(":")
     return dtime(hour=int(hh), minute=int(mm))
 
-def is_within_auto_window(dt: datetime) -> bool:
-    """True if dt is within AUTO_APPROVE_START..AUTO_APPROVE_END in TZ."""
-    start_t = parse_hhmm(AUTO_APPROVE_START)
-    end_t = parse_hhmm(AUTO_APPROVE_END)
-    start_dt = datetime.combine(dt.date(), start_t, TZ)
-    end_dt = datetime.combine(dt.date(), end_t, TZ)
-    return start_dt <= dt <= end_dt
-
-
-
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -174,7 +160,7 @@ def init_db():
             " start_ts INTEGER NOT NULL,"
             " planned_end_ts INTEGER NOT NULL,"
             " closed_ts INTEGER,"
-            " status TEXT NOT NULL,"  # open/closed
+            " status TEXT NOT NULL,"
             " last_reminder_ts INTEGER,"
             " last_koasyk_ts INTEGER,"
             " handoff_note TEXT"
@@ -186,7 +172,7 @@ def init_db():
             " slot_id INTEGER NOT NULL,"
             " task_id TEXT NOT NULL,"
             " task_name TEXT NOT NULL,"
-            " status TEXT NOT NULL,"  # pending/wait_photo/done
+            " status TEXT NOT NULL,"
             " done_ts INTEGER,"
             " photo_file_id TEXT"
             ")"
@@ -237,6 +223,16 @@ class ScheduleCache:
 SCHEDULE_CACHE = ScheduleCache()
 
 
+def _decode_csv_bytes(raw: bytes) -> str:
+    # чтобы не было "Ð¨ÐºÐ°ÑÑ..." — пробуем несколько кодировок
+    for enc in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            pass
+    return raw.decode("utf-8", errors="replace")
+
+
 def fetch_schedule_rows() -> list[dict]:
     # Cache 5 minutes
     if SCHEDULE_CACHE.rows is not None and (time.time() - SCHEDULE_CACHE.fetched_at) < 300:
@@ -247,25 +243,17 @@ def fetch_schedule_rows() -> list[dict]:
 
     r = requests.get(SCHEDULE_CSV_URL, timeout=25)
 
+    # Явно ловим 401/403 и даём нормальный текст
     if r.status_code in (401, 403):
         raise RuntimeError(
-            "401/403: нет доступа к Google Sheets. Открой доступ: Share → Anyone with the link → Viewer. "
-            "Или проверь SCHEDULE_CSV_URL (export?format=csv&gid=...)."
+            "401/403: Таблица недоступна. Сделай Google Sheet публичным: "
+            "Share → Anyone with the link → Viewer. "
+            "Или используй правильную export-ссылку."
         )
 
     r.raise_for_status()
 
-    # Декодирование (чтобы не было 'Ð¨ÐºÐ°ÑÑ...')
-    raw = r.content
-    csv_text = None
-    for enc in ("utf-8-sig", "utf-8", "cp1251"):
-        try:
-            csv_text = raw.decode(enc)
-            break
-        except Exception:
-            continue
-    if csv_text is None:
-        csv_text = raw.decode("utf-8", errors="replace")
+    csv_text = _decode_csv_bytes(r.content)
     reader = csv.DictReader(StringIO(csv_text))
     rows = list(reader)
     if not rows:
@@ -280,7 +268,6 @@ def fetch_schedule_rows() -> list[dict]:
             norm[kk] = vv
         norm_rows.append(norm)
 
-    # Required minimal columns
     for col in ["task_id", "task_name", "point"]:
         if col not in norm_rows[0]:
             raise RuntimeError(f"Missing column in schedule: {col}")
@@ -299,9 +286,7 @@ def get_today_tasks(point: str) -> list[dict]:
         if v is None:
             return False
         s = str(v).strip().lower()
-        if s in ("1", "true", "yes", "y", "да"):
-            return True
-        return False
+        return s in ("1", "true", "yes", "y", "да")
 
     tasks: list[dict] = []
     for row in rows:
@@ -322,7 +307,6 @@ def get_today_tasks(point: str) -> list[dict]:
         tasks.append({"task_id": task_id, "task_name": name})
 
     return tasks
-
 
 
 def _point_hours(point: str) -> tuple[dtime, dtime]:
@@ -369,22 +353,6 @@ def user_set_pending(tg_id: int, full_name: str):
             "INSERT INTO users (tg_id, full_name, status, created_at) "
             "VALUES (?, ?, 'pending', ?) "
             "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, status='pending'",
-            (tg_id, full_name, now_ts()),
-        )
-        conn.commit()
-        conn.close()
-
-
-
-def user_set_limited(tg_id: int, full_name: str):
-    """Create/update user with status='limited' (ограниченный доступ)."""
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO users (tg_id, full_name, status, created_at) "
-            "VALUES (?, ?, 'limited', ?) "
-            "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, status='limited'",
             (tg_id, full_name, now_ts()),
         )
         conn.commit()
@@ -597,22 +565,6 @@ def employee_menu():
     )
 
 
-def limited_menu():
-    """Меню для ограниченного доступа (автоактивация)."""
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📍 Выбрать точку"), KeyboardButton("📋 План сегодня")],
-            [KeyboardButton("▶️ Начать слот"), KeyboardButton("✅ Отметить выполненное")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def menu_for_status(status: str):
-    return limited_menu() if status == "limited" else employee_menu()
-
-
-
 def admin_menu():
     return ReplyKeyboardMarkup(
         [
@@ -671,16 +623,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     row = user_get(u.id)
 
-    if row and row["status"] in ("active", "limited"):
-        if row["status"] == "limited":
-            await update.message.reply_text(
-                "Ты активирован в ограниченном доступе (автоактивация).\nДоступно: точка, план, отметки и фото.\nДля полного доступа попроси руководителя подтвердить.",
-                reply_markup=limited_menu(),
-            )
-        else:
-            await update.message.reply_text("Ты активен. Выбирай действие.", reply_markup=employee_menu())
-            if is_admin(u.id):
-                await update.message.reply_text("Админ-меню: /admin", reply_markup=admin_menu())
+    if row and row["status"] == "active":
+        await update.message.reply_text("Ты активен. Выбирай действие.", reply_markup=employee_menu())
+        if is_admin(u.id):
+            await update.message.reply_text("Админ-меню: /admin", reply_markup=admin_menu())
         return
 
     await update.message.reply_text("Привет. Введи своё имя (как в отчётах), одним сообщением.\nПример: Иван Петров")
@@ -720,37 +666,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         full_name = context.user_data.get("reg_name", "Без имени")
-        now = now_dt()
-
-        # 09:00–15:00: автоактивация, но в ограниченном доступе
-        if is_within_auto_window(now):
-            user_set_limited(u.id, full_name)
-
-            # Уведомление в Контроль + кнопки: снять ограничения / заблокировать
-            if CONTROL_CHAT_ID != 0:
-                try:
-                    kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Снять ограничения", callback_data=f"appr:{u.id}"),
-                        InlineKeyboardButton("⛔ Заблокировать", callback_data=f"rej:{u.id}"),
-                    ]])
-                    await context.bot.send_message(
-                        CONTROL_CHAT_ID,
-                        f"✅ Автоактивация (ограниченно, {AUTO_APPROVE_START}-{AUTO_APPROVE_END})\n"
-                        f"• {full_name}\n• tg_id: {u.id}",
-                        reply_markup=kb,
-                    )
-                except Exception as e:
-                    logger.exception("Failed to notify CONTROL on auto-activation: %s", e)
-
-            await update.message.reply_text(
-                "✅ Готово. Ты активирован (ограниченный доступ).\n"
-                "Доступно: выбрать точку, план, отметки и фото.",
-                reply_markup=limited_menu(),
-            )
-            context.user_data.clear()
-            return
-
-        # Вне окна: обычная заявка на подтверждение
         user_set_pending(u.id, full_name)
 
         if CONTROL_CHAT_ID != 0:
@@ -761,7 +676,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
                 await context.bot.send_message(
                     CONTROL_CHAT_ID,
-                    f"Новая заявка сотрудника (вне окна автоактивации):\n• {full_name}\n• tg_id: {u.id}",
+                    f"Новая заявка сотрудника:\n• {full_name}\n• tg_id: {u.id}",
                     reply_markup=kb,
                 )
             except Exception as e:
@@ -773,22 +688,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.clear()
                 return
 
-        await update.message.reply_text(
-            f"⏰ Сейчас автоактивация не работает (только {AUTO_APPROVE_START}-{AUTO_APPROVE_END}).\n"
-            "Заявка отправлена. Жди подтверждения.",
-        )
+        await update.message.reply_text("Заявка отправлена. Жди подтверждения.")
         context.user_data.clear()
         return
 
-
     # Gate: only active employees can proceed
     row = user_get(u.id)
-    if not row or row["status"] not in ("active", "limited"):
+    if not row or row["status"] != "active":
         await update.message.reply_text("Нет доступа. Напиши /start и пройди регистрацию.")
         return
-
-    is_limited = (row["status"] == "limited")
-    current_menu = limited_menu() if is_limited else employee_menu()
 
     # Incident free text flow
     if context.user_data.get("incident_mode"):
@@ -808,7 +716,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("incident_wait_photo", None)
         context.user_data.pop("incident_text", None)
 
-        # Notify control
         if CONTROL_CHAT_ID != 0:
             try:
                 await context.bot.send_message(
@@ -880,19 +787,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "⚠️ Инцидент/Комментарий":
-        if is_limited:
-            await update.message.reply_text("⛔ Доступ ограничен. Инциденты доступны после подтверждения руководителем.", reply_markup=current_menu)
-            return
-
         context.user_data["incident_mode"] = True
         await update.message.reply_text("Напиши текст инцидента/комментария одним сообщением. Потом можно фото.")
         return
 
     if text == "🔁 Передать точку":
-        if is_limited:
-            await update.message.reply_text("⛔ Доступ ограничен. Передача точки доступна после подтверждения руководителем.", reply_markup=current_menu)
-            return
-
         open_slot = slot_get_open(u.id)
         if not open_slot:
             await update.message.reply_text("Нет активного слота. Сначала ▶️ Начать слот.")
@@ -902,10 +801,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return HANDOFF_COMMENT
 
     if text == "🧾 Фин. отчёт (закрыть слот)":
-        if is_limited:
-            await update.message.reply_text("⛔ Доступ ограничен. Финальный отчёт доступен после подтверждения руководителем.", reply_markup=current_menu)
-            return
-
         open_slot = slot_get_open(u.id)
         if not open_slot:
             await update.message.reply_text("Нет активного слота.")
@@ -915,7 +810,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введи ВНЕСЕНИЕ (число, можно 0):")
         return CLOSE_DEP
 
-    await update.message.reply_text("Ок. Выбирай действие.", reply_markup=current_menu)
+    await update.message.reply_text("Ок. Выбирай действие.", reply_markup=employee_menu())
 
 
 # -------------------- Callback queries --------------------
@@ -944,7 +839,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"⛔ Отклонён tg_id={tg_id}")
         return
 
-    # Set point (for plan, etc.)
+    # Set point
     if data.startswith("setpoint:"):
         point = data.split(":", 1)[1]
         if point not in POINTS:
@@ -954,7 +849,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Точка выбрана: {point}\nТеперь можно открыть 📋 План сегодня.")
         return
 
-    # Start slot flow
+    # Start slot
     if data.startswith("point:"):
         point = data.split(":", 1)[1]
         if point not in POINTS:
@@ -971,6 +866,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
         )
         return
+
     if data.startswith("full:"):
         point = data.split(":", 1)[1]
         if point not in POINTS:
@@ -1024,7 +920,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mark a task -> wait photo
     if data.startswith("done:"):
         row = user_get(u.id)
-        if not row or row["status"] not in ("active", "limited"):
+        if not row or row["status"] != "active":
             await q.edit_message_text("Нет доступа.")
             return
         if row["pending_task_id"]:
@@ -1092,6 +988,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["close_wait"] = "comment"
         await update.message.reply_text("Напиши комментарий по слоту (можно 'всё ок'):")
         return CLOSE_COMMENT
+
     await update.message.reply_text("Фото получено, но сейчас бот не ждёт фото.", reply_markup=employee_menu())
 
 
@@ -1173,7 +1070,6 @@ async def close_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shift_totals_upsert(slot_id, dep, cash, card, photo1, photo2, comment)
     slot_close(slot_id)
 
-    # Slot + task stats
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1226,7 +1122,6 @@ async def close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Jobs (reminders / summary) --------------------
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    # Find all open slots
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1243,7 +1138,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         slot_id = int(s["id"])
         planned_end = int(s["planned_end_ts"])
 
-        # Task stats
         with DB_LOCK:
             conn = db()
             cur = conn.cursor()
@@ -1254,7 +1148,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         pending = int(stats.get("pending", 0))
         waitp = int(stats.get("wait_photo", 0))
 
-        # Regular reminder
         last_rem = int(s["last_reminder_ts"] or 0)
         if now - last_rem >= REMINDER_INTERVAL_MIN * 60:
             if pending > 0 or waitp > 0:
@@ -1267,7 +1160,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
             slot_set_reminder_ts(slot_id, "last_reminder_ts", now)
 
-        # Overdue -> "Косяк снял..."
         if now > planned_end:
             reasons = []
             if pending > 0:
@@ -1473,10 +1365,7 @@ async def send_week_report(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
         disc = (done_tasks / total_tasks * 100.0) if total_tasks > 0 else 0.0
 
         koasyk_cnt = int(ko_rows.get(tg_id, 0))
-
-        combined.append(
-            {"name": name, "revph": revph, "disc": disc, "done": done_tasks, "total": total_tasks, "koasyk": koasyk_cnt}
-        )
+        combined.append({"name": name, "revph": revph, "disc": disc, "done": done_tasks, "total": total_tasks, "koasyk": koasyk_cnt})
 
     if not combined:
         await context.bot.send_message(to_chat, "🧾 Отчёт недели: нет данных.")
@@ -1501,7 +1390,6 @@ async def send_week_report(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
     await context.bot.send_message(to_chat, "\n".join(lines))
 
 
-
 # -------------------- Custom slot time flow --------------------
 async def slot_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     point = context.user_data.get("slot_point")
@@ -1523,9 +1411,8 @@ async def slot_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SLOT_TIME_START
 
     start_ts = _ts_today_at(t_start)
-    # Не даём старт в далёком будущем
     if start_ts > now_ts() + 10 * 60:
-        await update.message.reply_text("Начало получилось в будущем. Начни слот ближе к старту и введи время ещё раз.")
+        await update.message.reply_text("Начало получилось в будущем. Введи время ещё раз.")
         return SLOT_TIME_START
 
     context.user_data["slot_start_ts"] = start_ts
@@ -1560,11 +1447,9 @@ async def slot_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SLOT_TIME_END
 
     if now_ts() >= end_ts:
-        await update.message.reply_text("Окончание уже в прошлом. Проверь время и введи окончание ещё раз:")
+        await update.message.reply_text("Окончание уже в прошлом. Введи окончание ещё раз:")
         return SLOT_TIME_END
 
-    # Create slot
-    # Protect against duplicate open slot
     if slot_get_open(update.effective_user.id):
         await update.message.reply_text("У тебя уже есть открытый слот.", reply_markup=employee_menu())
         context.user_data.clear()
@@ -1579,7 +1464,7 @@ async def slot_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
-        f"Слот начат.\\nТочка: {point}\\nС: {datetime.fromtimestamp(int(start_ts), TZ).strftime('%H:%M')}\\nДо: {datetime.fromtimestamp(int(end_ts), TZ).strftime('%H:%M')}\\n\\nДальше: ✅ Отметить выполненное",
+        f"Слот начат.\nТочка: {point}\nС: {datetime.fromtimestamp(int(start_ts), TZ).strftime('%H:%M')}\nДо: {datetime.fromtimestamp(int(end_ts), TZ).strftime('%H:%M')}\n\nДальше: ✅ Отметить выполненное",
         reply_markup=employee_menu(),
     )
     context.user_data.clear()
@@ -1594,7 +1479,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Build app --------------------
 def build_app() -> Application:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required (.env)")
+        raise RuntimeError("BOT_TOKEN is required (.env / Render env vars)")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1618,7 +1503,6 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", close_cancel)],
         allow_reentry=True,
     )
-
 
     slot_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_callback, pattern=r"^custom:")],
@@ -1645,7 +1529,6 @@ def build_app() -> Application:
 
     app.add_error_handler(on_error)
 
-    # Jobs
     if app.job_queue is None:
         raise RuntimeError('JobQueue not available. Install: pip install "python-telegram-bot[job-queue]==21.6"')
 
@@ -1657,7 +1540,8 @@ def build_app() -> Application:
 
 def main():
     init_db()
-    build_app().run_polling(close_loop=False)
+    # drop_pending_updates помогает, если были старые апдейты
+    build_app().run_polling(close_loop=False, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
