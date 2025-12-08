@@ -45,12 +45,13 @@ from telegram.ext import (
 # -------------------- Logging --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
 # --- Security: hide Telegram token from logs (httpx prints request URLs) ---
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-s | %(levelname)s | %(name)s | %(message)s",
-)
+
 logger = logging.getLogger("wecafe-bot")
 
 # -------------------- Env --------------------
