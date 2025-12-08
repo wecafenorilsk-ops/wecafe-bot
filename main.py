@@ -2,27 +2,50 @@
 # -*- coding: utf-8 -*-
 
 """
-WeCafe Cleaning Bot (Telegram) — polling mode (python-telegram-bot 21.x)
+WeCafe Cleaning Bot (Telegram) — python-telegram-bot 21.x (polling)
 
-Key features implemented for your request:
-- Cleaning tasks are for the whole day/point, but RESPONSIBILITY is split into 2 zones (A/B) when two workers cover a day.
-- If a worker works the whole shift ("Смена целиком"), they get ALL tasks.
-- Reminders every 30 minutes stay, BUT the same "косяк" is sent only ONCE per violation per slot (no repeats every 30 min).
-- End-of-day financial report is allowed only after point closing time:
+What this version fixes (per your 3 issues + new requirements):
+1) Photos from cleaning tasks are forwarded to the "Контроль" group (CONTROL_CHAT_ID) with caption.
+   Also, if a user sends a photo when the bot isn't waiting for a photo, the bot will reply with guidance,
+   and (optionally) still forward that photo to "Контроль" as "unlinked photo".
+2) Re-registration loops: user/slot/cleaning data are stored in DATA_DIR.
+   - On Render, attach a Persistent Disk mounted at /var/data, and set DATA_DIR=/var/data in Environment.
+3) Auto-registration window 09:00–15:00:
+   - Inside window: user is auto-activated (limited locks).
+   - Outside window: user becomes "pending" and an approval request with buttons is sent to "Контроль".
+
+Other included behavior:
+- Tasks are "for the whole day + point", but responsibility is split into 2 zones A/B.
+  First half-shift slot gets A, second gets B; whole shift gets ALL tasks.
+- Reminders every 30 minutes:
+  - First reminder for "cleaning not done" is a strict "косяк" message once.
+  - Next reminders are gentle (no repeating the same "косяк" text).
+- End-of-day financial report only after closing time:
     69 Параллель, Арена: after 22:00
     Кафе Музей: after 19:00
-- Includes a tiny HTTP health server for Render Web Service port scan (returns "ok").
-- Suppresses httpx/httpcore INFO logs so BOT_TOKEN doesn't appear in logs.
+- Tiny HTTP health server for Render Web Service port scan (returns "ok").
+- Suppresses httpx/httpcore INFO logs to avoid printing BOT_TOKEN in logs.
+
+ENV (Render -> Environment):
+BOT_TOKEN=...
+ADMIN_IDS=123,456
+CONTROL_CHAT_ID=-100...
+ACCESS_CODE=wecafe2026
+SCHEDULE_CSV_URL=https://docs.google.com/spreadsheets/d/<ID>/export?format=csv&gid=<GID>
+TZ=Asia/Krasnoyarsk   # Norilsk
+AUTO_APPROVE_START=09:00
+AUTO_APPROVE_END=15:00
+REMINDER_INTERVAL_MIN=30
+DATA_DIR=/var/data     # IMPORTANT on Render with Persistent Disk
+PORT=10000             # Render provides PORT automatically
 """
 
-import asyncio
 import csv
 import json
 import logging
 import os
 import re
 import threading
-from dataclasses import dataclass
 from datetime import datetime, time, timedelta, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
@@ -62,23 +85,25 @@ if not BOT_TOKEN:
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "0").strip() or "0")
 
-ACCESS_CODE = os.getenv("ACCESS_CODE", "").strip()
-if not ACCESS_CODE:
-    ACCESS_CODE = "wecafe2026"  # safe default if you forgot
+ACCESS_CODE = os.getenv("ACCESS_CODE", "wecafe2026").strip()
 
 TZ_NAME = os.getenv("TZ", "Asia/Krasnoyarsk").strip()  # Norilsk
 TZ = ZoneInfo(TZ_NAME)
 
 SCHEDULE_CSV_URL = os.getenv("SCHEDULE_CSV_URL", "").strip()
 
-END_OF_DAY_TIME = os.getenv("END_OF_DAY_TIME", "22:30").strip()  # daily admin summary time, not closing time gate
-REMINDER_INTERVAL_MIN = int(os.getenv("REMINDER_INTERVAL_MIN", "30").strip() or "30")
-
-# Auto-approve window (not the focus right now, but kept for continuity)
 AUTO_APPROVE_START = os.getenv("AUTO_APPROVE_START", "09:00").strip()
 AUTO_APPROVE_END = os.getenv("AUTO_APPROVE_END", "15:00").strip()
 
+REMINDER_INTERVAL_MIN = int(os.getenv("REMINDER_INTERVAL_MIN", "30").strip() or "30")
+
 PORT = int(os.getenv("PORT", "10000").strip() or "10000")
+
+DATA_DIR = (os.getenv("DATA_DIR") or "").strip()
+if not DATA_DIR:
+    # Prefer /var/data if it exists (Render persistent disk mount point)
+    DATA_DIR = "/var/data" if os.path.isdir("/var/data") else os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 POINTS = ["69 Параллель", "Арена", "Кафе Музей"]
 
@@ -101,11 +126,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("wecafe-bot")
 
-
-# ----------------- STORAGE -----------------
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
+# ----------------- FILE PATHS -----------------
 
 USERS_PATH = os.path.join(DATA_DIR, "users.json")
 SLOTS_PATH = os.path.join(DATA_DIR, "slots.json")
@@ -149,7 +170,6 @@ def save_slots(slots: Dict[str, dict]) -> None:
 
 
 def load_cleaning() -> Dict[str, dict]:
-    # per day+point state: tasks, split_map, done
     return _load_json(CLEANING_PATH, {})
 
 
@@ -158,8 +178,7 @@ def save_cleaning(cleaning: Dict[str, dict]) -> None:
 
 
 def load_violations() -> Dict[str, dict]:
-    # per slot: which violation keys already sent
-    return _load_json(VIOLATIONS_PATH, {})
+    return _load_json(VIOLATIONS_PATH, {"sent": {}, "gentle_sent": {}})
 
 
 def save_violations(v: Dict[str, dict]) -> None:
@@ -167,7 +186,6 @@ def save_violations(v: Dict[str, dict]) -> None:
 
 
 def load_reports() -> Dict[str, dict]:
-    # end of day per date+point report
     return _load_json(REPORTS_PATH, {})
 
 
@@ -187,7 +205,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # silence default http server logs
         return
 
 
@@ -219,6 +236,10 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def parse_hhmm(s: str) -> time:
     m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{2})\s*$", s)
     if not m:
@@ -241,12 +262,12 @@ def in_auto_approve_window(dt: datetime) -> bool:
     return st <= dt <= en
 
 
-def point_close_time(point: str) -> time:
-    return POINT_HOURS.get(point, (time(10, 0), time(22, 0)))[1]
-
-
 def point_open_time(point: str) -> time:
     return POINT_HOURS.get(point, (time(10, 0), time(22, 0)))[0]
+
+
+def point_close_time(point: str) -> time:
+    return POINT_HOURS.get(point, (time(10, 0), time(22, 0)))[1]
 
 
 def after_close_now(point: str) -> bool:
@@ -257,10 +278,9 @@ def after_close_now(point: str) -> bool:
 
 
 def slot_duration_minutes(start: time, end: time) -> int:
-    # assume same day
-    dt = now_tz().date()
-    s = datetime(dt.year, dt.month, dt.day, start.hour, start.minute, tzinfo=TZ)
-    e = datetime(dt.year, dt.month, dt.day, end.hour, end.minute, tzinfo=TZ)
+    d = now_tz().date()
+    s = datetime(d.year, d.month, d.day, start.hour, start.minute, tzinfo=TZ)
+    e = datetime(d.year, d.month, d.day, end.hour, end.minute, tzinfo=TZ)
     if e < s:
         e += timedelta(days=1)
     return int((e - s).total_seconds() // 60)
@@ -270,17 +290,48 @@ def shift_duration_minutes(point: str) -> int:
     return slot_duration_minutes(point_open_time(point), point_close_time(point))
 
 
-def safe_md(text: str) -> str:
-    # We use HTML parse mode by default to avoid markdown entity issues
-    return text
+def is_within_point_hours(point: str) -> bool:
+    dt = now_tz()
+    op = point_open_time(point)
+    cl = point_close_time(point)
+    op_dt = dt.replace(hour=op.hour, minute=op.minute, second=0, microsecond=0)
+    cl_dt = dt.replace(hour=cl.hour, minute=cl.minute, second=0, microsecond=0)
+    return op_dt <= dt <= cl_dt
 
 
-def html_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+# ----------------- USERS -----------------
+
+def user_name(users: Dict[str, dict], user_id: int) -> str:
+    u = users.get(str(user_id))
+    return (u or {}).get("name") or f"user{user_id}"
+
+
+def is_active_user(u: Optional[dict]) -> bool:
+    return bool(u and u.get("active", False))
+
+
+def is_limited_user(u: Optional[dict]) -> bool:
+    return bool(u and u.get("limited", False))
+
+
+def is_pending_user(u: Optional[dict]) -> bool:
+    return bool(u and u.get("pending", False))
+
+
+def can_use_feature(u: Optional[dict], feature: str) -> bool:
+    """
+    feature:
+      - choose_point, slot, plan, mark, transfer, incident, report, admin
+    """
+    if not u:
+        return False
+    if is_admin(u.get("id", 0)):
+        return True
+    if not is_active_user(u):
+        return False
+    if is_limited_user(u):
+        return feature in {"choose_point", "slot", "plan", "mark"}
+    return True
 
 
 # ----------------- SCHEDULE LOADING -----------------
@@ -293,58 +344,88 @@ def fetch_schedule_csv() -> str:
     return resp.text
 
 
-def detect_and_fix_text(s: str) -> str:
-    # Sometimes Google CSV is utf-8 but read incorrectly elsewhere.
-    # Here we just return as-is; PTB messages are UTF-8.
+def fix_mojibake(s: str) -> str:
+    # Fix "Ð¨ÐºÐ°ÑÑ" style text if it happens
+    if "Ð" in s or "Ñ" in s:
+        try:
+            return s.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            return s
     return s
 
 
-def parse_schedule_tasks_for_today(schedule_csv_text: str, point: str, day: date) -> List[str]:
+def parse_schedule_tasks_for_today(schedule_csv_text: str, day: date) -> List[str]:
     """
-    Expected CSV layout (simple):
-    columns: day, point, task
-    where day is YYYY-MM-DD or day-of-month number.
-    If your Google sheet differs, adapt this function.
-    """
-    data = schedule_csv_text
-    # Try to handle possible encoding artifacts
-    if "Ð" in data or "Ñ" in data:
-        # likely double-decoded; attempt to fix from latin-1 -> utf-8
-        try:
-            data = data.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
-        except Exception:
-            pass
+    Supports 2 common CSV shapes:
 
-    f = StringIO(data)
+    (A) "list" CSV with columns: task (or Задача) and optional day/date column.
+        day can be YYYY-MM-DD or day-of-month number.
+
+    (B) "matrix" CSV:
+        first row: [task_name_col, 1,2,3,...,31]
+        next rows: [task_name, x/1/yes, ...]
+        A non-empty cell under today's day means the task is scheduled for today.
+
+    If you have separate sheets per point, set SCHEDULE_CSV_URL accordingly per point.
+    """
+    txt = schedule_csv_text
+    txt = fix_mojibake(txt)
+
+    # Try dict mode first
+    f = StringIO(txt)
     reader = csv.DictReader(f)
-    out = []
-    day_iso = day.isoformat()
-    day_num = str(day.day)
+    if reader.fieldnames and any((fn or "").strip().lower() in {"task", "задача", "задачи"} for fn in reader.fieldnames):
+        out = []
+        day_iso = day.isoformat()
+        day_num = str(day.day)
+        for row in reader:
+            r_task = (row.get("task") or row.get("задача") or row.get("Задача") or "").strip()
+            if not r_task:
+                continue
+            r_day = (row.get("day") or row.get("date") or row.get("день") or row.get("Дата") or "").strip()
+            if r_day and (r_day != day_iso and r_day != day_num):
+                continue
+            out.append(fix_mojibake(r_task))
+        if out:
+            return out
 
-    for row in reader:
-        r_day = (row.get("day") or row.get("date") or row.get("день") or row.get("Дата") or "").strip()
-        r_point = (row.get("point") or row.get("точка") or row.get("Точка") or "").strip()
-        r_task = (row.get("task") or row.get("задача") or row.get("Задача") or "").strip()
+    # Matrix mode
+    f2 = StringIO(txt)
+    rows = list(csv.reader(f2))
+    if not rows or len(rows) < 2:
+        return []
 
-        if not r_task:
+    header = [c.strip() for c in rows[0]]
+    # Find column for today's day number
+    day_col = None
+    for i, h in enumerate(header):
+        if h.strip() == str(day.day):
+            day_col = i
+            break
+    if day_col is None:
+        # some exports use "01", "02"
+        dd = f"{day.day:02d}"
+        for i, h in enumerate(header):
+            if h.strip() == dd:
+                day_col = i
+                break
+    if day_col is None:
+        return []
+
+    tasks = []
+    for r in rows[1:]:
+        if not r:
             continue
-
-        if r_point and r_point != point:
+        task_name = (r[0] if len(r) > 0 else "").strip()
+        if not task_name:
             continue
-
-        # day match: exact ISO or day-of-month
-        if r_day and (r_day != day_iso and r_day != day_num):
-            continue
-
-        out.append(detect_and_fix_text(r_task))
-
-    # If the sheet is a matrix by day-of-month on X and tasks on Y, you likely exported a different structure.
-    # In that case use the previous version of bot or give a proper CSV export.
-    return out
+        cell = (r[day_col] if len(r) > day_col else "").strip()
+        if cell:
+            tasks.append(fix_mojibake(task_name))
+    return tasks
 
 
 def split_tasks_two_zones(tasks: List[str]) -> Tuple[List[str], List[str]]:
-    # alternating split gives more even workload
     a, b = [], []
     for i, t in enumerate(tasks):
         (a if i % 2 == 0 else b).append(t)
@@ -353,57 +434,30 @@ def split_tasks_two_zones(tasks: List[str]) -> Tuple[List[str], List[str]]:
 
 # ----------------- CLEANING STATE -----------------
 
-def get_or_init_day_point_cleaning(day: str, point: str) -> dict:
-    cleaning = load_cleaning()
-    k = day_point_key(day, point)
-    if k not in cleaning:
-        cleaning[k] = {
-            "day": day,
-            "point": point,
-            "tasks": [],            # full task list for the day+point
-            "split": {},            # task_index -> "A"/"B"
-            "done": {},             # task_index -> {by, ts, photo_file_id}
-        }
-        save_cleaning(cleaning)
-    return cleaning[k]
-
-
 def ensure_tasks_loaded(day: str, point: str) -> List[str]:
     cleaning = load_cleaning()
     k = day_point_key(day, point)
-    state = cleaning.get(k)
-    if not state:
-        state = get_or_init_day_point_cleaning(day, point)
-        cleaning = load_cleaning()
+    state = cleaning.get(k) or {"day": day, "point": point, "tasks": [], "split": {}, "done": {}}
 
     if state.get("tasks"):
         return state["tasks"]
 
+    # Load from schedule
     if not SCHEDULE_CSV_URL:
-        # fallback demo tasks
         tasks = [
             "Шкафы: прибраться внутри",
-            "Кофемашину сверху протереть",
             "Проверка на ротацию продукции",
             "Дверцы шкафчиков и стойка со стороны гостей",
+            "Кофемашину сверху протереть",
         ]
     else:
         txt = fetch_schedule_csv()
-        tasks = parse_schedule_tasks_for_today(txt, point, datetime.fromisoformat(day).date())
+        tasks = parse_schedule_tasks_for_today(txt, datetime.fromisoformat(day).date())
 
-    # store tasks + split map
-    a, b = split_tasks_two_zones(tasks)
-    split = {}
-    for idx, _ in enumerate(tasks):
-        split[str(idx)] = "A" if idx % 2 == 0 else "B"
-
-    state = {
-        "day": day,
-        "point": point,
-        "tasks": tasks,
-        "split": split,
-        "done": state.get("done", {}),
-    }
+    # Store split map
+    split = {str(i): ("A" if i % 2 == 0 else "B") for i in range(len(tasks))}
+    state["tasks"] = tasks
+    state["split"] = split
     cleaning[k] = state
     save_cleaning(cleaning)
     return tasks
@@ -427,7 +481,7 @@ def remaining_task_indices(day: str, point: str, group: str) -> List[int]:
     if not state or not state.get("tasks"):
         ensure_tasks_loaded(day, point)
         cleaning = load_cleaning()
-        state = cleaning[day_point_key(day, point)]
+        state = cleaning.get(day_point_key(day, point), {"done": {}, "split": {}, "tasks": []})
 
     done = state.get("done", {})
     remaining = []
@@ -444,7 +498,7 @@ def mark_task_done(day: str, point: str, idx: int, by_user_id: int, by_name: str
     if not state:
         ensure_tasks_loaded(day, point)
         cleaning = load_cleaning()
-        state = cleaning[k]
+        state = cleaning.get(k)
 
     state.setdefault("done", {})
     state["done"][str(idx)] = {
@@ -457,19 +511,10 @@ def mark_task_done(day: str, point: str, idx: int, by_user_id: int, by_name: str
     save_cleaning(cleaning)
 
 
-# ----------------- SLOT / RESPONSIBILITY -----------------
+# ----------------- SLOT STATE (A/B responsibility) -----------------
 
 def new_slot_id() -> str:
     return f"s{int(now_tz().timestamp())}{os.getpid()}"
-
-
-def get_user(users: Dict[str, dict], user_id: int) -> Optional[dict]:
-    return users.get(str(user_id))
-
-
-def user_name(users: Dict[str, dict], user_id: int) -> str:
-    u = get_user(users, user_id)
-    return (u or {}).get("name") or f"user{user_id}"
 
 
 def open_slot_for_user(user_id: int) -> Optional[dict]:
@@ -480,12 +525,9 @@ def open_slot_for_user(user_id: int) -> Optional[dict]:
     return None
 
 
-def active_slot_for_point(day: str, point: str) -> List[dict]:
+def slots_for_day_point(day: str, point: str) -> List[dict]:
     slots = load_slots()
-    out = []
-    for s in slots.values():
-        if s.get("day") == day and s.get("point") == point:
-            out.append(s)
+    out = [s for s in slots.values() if s.get("day") == day and s.get("point") == point]
     out.sort(key=lambda x: x.get("opened_at", ""))
     return out
 
@@ -493,11 +535,10 @@ def active_slot_for_point(day: str, point: str) -> List[dict]:
 def decide_group_for_slot(day: str, point: str, full_shift: bool) -> str:
     if full_shift:
         return "ALL"
-    slots = active_slot_for_point(day, point)
-    # Count already created slots today for this point (any status)
-    # First slot gets A, second gets B, others default to B.
+    slots = slots_for_day_point(day, point)
     count = len(slots)
-    if count <= 0:
+    # first => A, second => B, others => B
+    if count == 0:
         return "A"
     if count == 1:
         return "B"
@@ -505,61 +546,87 @@ def decide_group_for_slot(day: str, point: str, full_shift: bool) -> str:
 
 
 def slot_is_full_shift(point: str, start: time, end: time) -> bool:
-    # If duration >= 85% of full shift -> treat as full shift
     dur = slot_duration_minutes(start, end)
     full = shift_duration_minutes(point)
     return dur >= int(full * 0.85)
 
 
-# ----------------- ACCESS CONTROL -----------------
-
-def is_active(user: dict) -> bool:
-    return bool(user and user.get("active", True))
-
-
-def is_confirmed(user: dict) -> bool:
-    return bool(user and user.get("confirmed", False))
-
-
-def is_limited(user: dict) -> bool:
-    # limited users allowed only: choose point, view plan, mark tasks, upload photos
-    return bool(user and user.get("limited", False))
+def get_user_group_for_today(uid: int, day: str, point: str) -> str:
+    # prefer open slot; else last slot for today
+    slots = slots_for_day_point(day, point)
+    user_slots = [s for s in slots if s.get("user_id") == uid]
+    if not user_slots:
+        return "A"
+    # open first
+    for s in user_slots:
+        if s.get("status") == "open":
+            return s.get("group", "A")
+    return user_slots[-1].get("group", "A")
 
 
-def require_user(update: Update) -> dict:
-    users = load_users()
-    u = users.get(str(update.effective_user.id))
-    if not u:
-        return {}
-    return u
+# ----------------- VIOLATIONS (no spam) -----------------
+
+def vkey(slot_id: str, vtype: str) -> str:
+    return f"{slot_id}::{vtype}"
 
 
-def can_use_feature(user: dict, feature: str) -> bool:
-    """
-    feature:
-      - "choose_point"
-      - "plan"
-      - "mark"
-      - "transfer"
-      - "incident"
-      - "report"
-      - "admin"
-    """
-    if not user:
-        return False
-    if is_admin(user.get("id", 0)):
-        return True
-    if not is_active(user):
-        return False
-
-    if is_limited(user):
-        return feature in {"choose_point", "plan", "mark"}
-
-    # normal active user
-    return True
+def v_already_sent(slot_id: str, vtype: str) -> bool:
+    v = load_violations()
+    return bool(v.get("sent", {}).get(vkey(slot_id, vtype)))
 
 
-# ----------------- CONVERSATIONS -----------------
+def v_already_gentle(slot_id: str, vtype: str) -> bool:
+    v = load_violations()
+    return bool(v.get("gentle_sent", {}).get(vkey(slot_id, vtype)))
+
+
+def v_set_sent(slot_id: str, vtype: str, strict: bool, value: bool = True):
+    v = load_violations()
+    if strict:
+        store = v.setdefault("sent", {})
+    else:
+        store = v.setdefault("gentle_sent", {})
+    key = vkey(slot_id, vtype)
+    if value:
+        store[key] = now_tz().isoformat()
+    else:
+        store.pop(key, None)
+    save_violations(v)
+
+
+def v_clear_for_user(uid: int, vtype: str):
+    slot = open_slot_for_user(uid)
+    if not slot:
+        return
+    v_set_sent(slot["id"], vtype, strict=True, value=False)
+    v_set_sent(slot["id"], vtype, strict=False, value=False)
+
+
+# ----------------- UI -----------------
+
+def main_menu_kb(u: dict) -> InlineKeyboardMarkup:
+    btns = [
+        [InlineKeyboardButton("🏷 Выбрать точку", callback_data="choose_point")],
+        [InlineKeyboardButton("▶️ Открыть слот (начать работу)", callback_data="open_slot")],
+        [InlineKeyboardButton("🧹 План уборки сегодня", callback_data="plan_today")],
+        [InlineKeyboardButton("✅ Отметить выполненное (с фото)", callback_data="mark_tasks")],
+    ]
+    if not is_limited_user(u):
+        btns += [
+            [InlineKeyboardButton("🔁 Передать точку (закрыть слот)", callback_data="transfer_point")],
+            [InlineKeyboardButton("🧾 Фин. отчёт (закрытие дня)", callback_data="fin_report")],
+            [InlineKeyboardButton("💬 Инцидент / Комментарий", callback_data="incident")],
+        ]
+    if is_admin(u.get("id", 0)):
+        btns.append([InlineKeyboardButton("🛠 Админка", callback_data="admin")])
+    return InlineKeyboardMarkup(btns)
+
+
+def points_kb(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(p, callback_data=f"{prefix}:{p}")] for p in POINTS])
+
+
+# ----------------- CONVERSATION STATES -----------------
 
 REG_NAME, REG_CODE = range(2)
 
@@ -569,31 +636,9 @@ MARK_PICK_TASK, MARK_WAIT_PHOTO = range(2)
 
 TRANSFER_WAIT_COMMENT = 1
 
-REPORT_POINT, REPORT_CASH, REPORT_CASHLESS, REPORT_PHOTO = range(4)
+REPORT_CASH, REPORT_CASHLESS, REPORT_PHOTO = range(3)
 
-
-# ----------------- UI -----------------
-
-def main_menu_kb(user: dict) -> InlineKeyboardMarkup:
-    btns = []
-    btns.append([InlineKeyboardButton("🏷 Выбрать точку", callback_data="choose_point")])
-    btns.append([InlineKeyboardButton("🧹 План уборки сегодня", callback_data="plan_today")])
-    btns.append([InlineKeyboardButton("✅ Отметить выполненное (с фото)", callback_data="mark_tasks")])
-
-    # Limited users stop here
-    if not is_limited(user):
-        btns.append([InlineKeyboardButton("🔁 Передать точку (закрыть слот)", callback_data="transfer_point")])
-        btns.append([InlineKeyboardButton("🧾 Фин. отчёт (закрытие дня)", callback_data="fin_report")])
-        btns.append([InlineKeyboardButton("💬 Инцидент / Комментарий", callback_data="incident")])
-
-    if is_admin(user.get("id", 0)):
-        btns.append([InlineKeyboardButton("🛠 Админка", callback_data="admin")])
-
-    return InlineKeyboardMarkup(btns)
-
-
-def points_kb(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(p, callback_data=f"{prefix}:{p}")] for p in POINTS])
+INCIDENT_WAIT = 1
 
 
 # ----------------- START / REGISTER -----------------
@@ -603,10 +648,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = users.get(str(uid))
 
-    if u and is_active(u):
+    if u and is_active_user(u):
+        await update.message.reply_text("Меню:", reply_markup=main_menu_kb(u))
+        return ConversationHandler.END
+
+    if u and is_pending_user(u):
         await update.message.reply_text(
-            "Меню:",
-            reply_markup=main_menu_kb(u)
+            "⏳ Твоя регистрация ожидает одобрения руководителем.\n"
+            "Напиши позже или дождись подтверждения.",
+            reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
 
@@ -628,57 +678,154 @@ async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reg_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = (update.message.text or "").strip()
     uid = update.effective_user.id
-    name = context.user_data.get("reg_name", update.effective_user.first_name)
+    name = context.user_data.get("reg_name") or (update.effective_user.first_name or "Сотрудник")
 
     if code != ACCESS_CODE:
         await update.message.reply_text("Код неверный. Попробуй ещё раз.")
         return REG_CODE
 
-    users = load_users()
     dt = now_tz()
-
-    # Auto-approve limited users in window
     auto = in_auto_approve_window(dt)
+
+    users = load_users()
+
+    if auto:
+        users[str(uid)] = {
+            "id": uid,
+            "name": name,
+            "active": True,
+            "pending": False,
+            "limited": True,  # locks
+            "registered_at": dt.isoformat(),
+            "auto_approved": True,
+        }
+        save_users(users)
+
+        if CONTROL_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=CONTROL_CHAT_ID,
+                    text=f"✅ Автоактивация: {name} ({uid}) [09:00–15:00, ограниченный доступ]"
+                )
+            except Exception:
+                pass
+
+        await update.message.reply_text(
+            "✅ Ок! Ты активирован (ограниченный доступ).\n"
+            "Доступно: выбрать точку, открыть слот, смотреть план и отмечать задачи с фото.\n\nМеню:",
+            reply_markup=main_menu_kb(users[str(uid)])
+        )
+        return ConversationHandler.END
+
+    # Outside auto window -> pending approval
     users[str(uid)] = {
         "id": uid,
         "name": name,
-        "active": True,
-        "confirmed": True,    # you asked auto-activation with locks; confirmed=True but limited=True still
-        "limited": True,      # locks: only choose/plan/mark
+        "active": False,
+        "pending": True,
+        "limited": True,
         "registered_at": dt.isoformat(),
-        "auto_approved": auto,
+        "auto_approved": False,
     }
     save_users(users)
 
-    # notify control group
+    await update.message.reply_text(
+        "⏳ Заявка на регистрацию отправлена руководителю.\n"
+        "Как только одобрят — бот напишет тебе.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
     if CONTROL_CHAT_ID:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_user:{uid}"),
+            InlineKeyboardButton("❌ Отказать", callback_data=f"deny_user:{uid}"),
+        ]])
         try:
             await context.bot.send_message(
                 chat_id=CONTROL_CHAT_ID,
-                text=f"✅ Новый сотрудник активирован: {name} ({uid}) [ограниченный доступ]"
+                text=f"🟡 Заявка на регистрацию:\nИмя: {name}\nuser_id: {uid}\n(вне окна 09:00–15:00)",
+                reply_markup=kb
             )
         except Exception:
             pass
 
-    await update.message.reply_text(
-        "✅ Ок! Ты добавлен.\n"
-        "Сейчас доступно: выбрать точку, смотреть план уборки и отмечать задачи с фото.\n\n"
-        "Открой меню:",
-        reply_markup=main_menu_kb(users[str(uid)])
-    )
     return ConversationHandler.END
 
 
-# ----------------- POINT SELECTION -----------------
+async def approve_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    admin_id = update.effective_user.id
+    if not is_admin(admin_id):
+        await q.edit_message_text("Нет прав.")
+        return
+    uid = int(q.data.split(":", 1)[1])
+
+    users = load_users()
+    u = users.get(str(uid))
+    if not u:
+        await q.edit_message_text("Пользователь не найден.")
+        return
+    u["active"] = True
+    u["pending"] = False
+    u["limited"] = True
+    u["approved_at"] = now_tz().isoformat()
+    u["approved_by"] = admin_id
+    users[str(uid)] = u
+    save_users(users)
+
+    try:
+        await context.bot.send_message(chat_id=uid, text="✅ Тебя одобрили. Напиши /start")
+    except Exception:
+        pass
+
+    await q.edit_message_text(f"✅ Одобрено: {u.get('name')} ({uid})")
+
+
+async def deny_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    admin_id = update.effective_user.id
+    if not is_admin(admin_id):
+        await q.edit_message_text("Нет прав.")
+        return
+    uid = int(q.data.split(":", 1)[1])
+
+    users = load_users()
+    u = users.get(str(uid))
+    if not u:
+        await q.edit_message_text("Пользователь не найден.")
+        return
+
+    # keep record but disable
+    u["active"] = False
+    u["pending"] = False
+    u["denied_at"] = now_tz().isoformat()
+    u["denied_by"] = admin_id
+    users[str(uid)] = u
+    save_users(users)
+
+    try:
+        await context.bot.send_message(chat_id=uid, text="❌ Регистрация не одобрена. Обратись к руководителю.")
+    except Exception:
+        pass
+
+    await q.edit_message_text(f"❌ Отказано: {u.get('name')} ({uid})")
+
+
+# ----------------- CHOOSE POINT -----------------
 
 async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user = require_user(update)
-    if not can_use_feature(user, "choose_point"):
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return
+    if not can_use_feature(u, "choose_point"):
         await q.edit_message_text("Нет доступа.")
         return
-
     await q.edit_message_text("Выбери точку:", reply_markup=points_kb("set_point"))
 
 
@@ -690,48 +837,162 @@ async def set_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = users.get(str(uid))
     if not u:
-        await q.edit_message_text("Нужно /start и регистрация.")
+        await q.edit_message_text("Нужно /start")
         return
 
     u["point"] = point
     users[str(uid)] = u
     save_users(users)
 
-    await q.edit_message_text(f"✅ Точка установлена: <b>{html_escape(point)}</b>\n\nМеню:", parse_mode=ParseMode.HTML)
+    await q.edit_message_text(f"✅ Точка установлена: <b>{html_escape(point)}</b>", parse_mode=ParseMode.HTML)
     await q.message.reply_text("Меню:", reply_markup=main_menu_kb(u))
+
+
+# ----------------- OPEN SLOT -----------------
+
+async def open_slot_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return ConversationHandler.END
+    if not can_use_feature(u, "slot"):
+        await q.edit_message_text("Нет доступа.")
+        return ConversationHandler.END
+
+    if open_slot_for_user(update.effective_user.id):
+        await q.edit_message_text("У тебя уже есть открытый слот. Закрой его через 'Передать точку'.", reply_markup=main_menu_kb(u))
+        return ConversationHandler.END
+
+    # choose point (default to user's point)
+    await q.edit_message_text("Для какого места открываем слот? (можешь выбрать заново)", reply_markup=points_kb("slot_point"))
+    return SLOT_POINT
+
+
+async def slot_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    point = q.data.split(":", 1)[1]
+    context.user_data["slot_point"] = point
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟩 Смена целиком", callback_data="slot_mode:full")],
+        [InlineKeyboardButton("🟨 Со скольки до скольки", callback_data="slot_mode:range")],
+    ])
+    await q.edit_message_text(f"Точка: <b>{html_escape(point)}</b>\nВыбери режим:", parse_mode=ParseMode.HTML, reply_markup=kb)
+    return SLOT_MODE
+
+
+async def slot_mode_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    mode = q.data.split(":", 1)[1]
+    point = context.user_data.get("slot_point")
+    if not point:
+        await q.edit_message_text("Сначала выбери точку.")
+        return ConversationHandler.END
+
+    if mode == "full":
+        op = point_open_time(point)
+        cl = point_close_time(point)
+        await create_slot(update, context, point, op, cl)
+        users = load_users()
+        u = users.get(str(update.effective_user.id), {})
+        await q.edit_message_text("✅ Слот открыт (смена целиком).", reply_markup=main_menu_kb(u))
+        return ConversationHandler.END
+
+    await q.edit_message_text("Напиши время так: <b>HH:MM-HH:MM</b>\nНапример: <b>10:00-16:00</b>", parse_mode=ParseMode.HTML)
+    return SLOT_TIME
+
+
+async def slot_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    m = re.match(r"^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*$", text)
+    if not m:
+        await update.message.reply_text("Нужно так: HH:MM-HH:MM. Например 10:00-16:00")
+        return SLOT_TIME
+    start = parse_hhmm(m.group(1))
+    end = parse_hhmm(m.group(2))
+    point = context.user_data.get("slot_point")
+    if not point:
+        await update.message.reply_text("Сначала выбери точку.")
+        return ConversationHandler.END
+
+    await create_slot(update, context, point, start, end)
+    users = load_users()
+    u = users.get(str(update.effective_user.id), {})
+    await update.message.reply_text("✅ Слот открыт.", reply_markup=main_menu_kb(u))
+    return ConversationHandler.END
+
+
+async def create_slot(update: Update, context: ContextTypes.DEFAULT_TYPE, point: str, start: time, end: time):
+    uid = update.effective_user.id
+    day = today_key()
+    full = slot_is_full_shift(point, start, end)
+    group = decide_group_for_slot(day, point, full)
+
+    slot = {
+        "id": new_slot_id(),
+        "user_id": uid,
+        "day": day,
+        "point": point,
+        "start": start.strftime("%H:%M"),
+        "end": end.strftime("%H:%M"),
+        "group": group,
+        "status": "open",
+        "opened_at": now_tz().isoformat(),
+    }
+    slots = load_slots()
+    slots[slot["id"]] = slot
+    save_slots(slots)
+
+    # also store user's point as current
+    users = load_users()
+    u = users.get(str(uid))
+    if u:
+        u["point"] = point
+        users[str(uid)] = u
+        save_users(users)
+
+    if CONTROL_CHAT_ID:
+        try:
+            users = load_users()
+            name = user_name(users, uid)
+            await context.bot.send_message(
+                chat_id=CONTROL_CHAT_ID,
+                text=f"▶️ Слот открыт: {point} | {name} ({uid}) | {slot['start']}-{slot['end']} | зона {group}",
+            )
+        except Exception:
+            pass
 
 
 # ----------------- PLAN TODAY -----------------
 
-def get_user_group_for_today(uid: int, day: str, point: str) -> str:
-    # If user has an open slot today on that point, use its group. Otherwise default:
-    slots = load_slots()
-    for s in slots.values():
-        if s.get("day") == day and s.get("point") == point and s.get("user_id") == uid:
-            if s.get("status") == "open":
-                return s.get("group", "A")
-    # If no slot, we still show something: default A
-    return "A"
-
-
 async def plan_today_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user = require_user(update)
-    if not can_use_feature(user, "plan"):
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return
+    if not can_use_feature(u, "plan"):
         await q.edit_message_text("Нет доступа.")
         return
 
-    point = user.get("point")
+    point = u.get("point")
     if not point:
         await q.edit_message_text("Сначала выбери точку.", reply_markup=points_kb("set_point"))
         return
 
     day = today_key()
     group = get_user_group_for_today(update.effective_user.id, day, point)
+
     tasks = tasks_for_group(day, point, group)
-    cleaning = load_cleaning()[day_point_key(day, point)]
-    done = cleaning.get("done", {})
+    state = load_cleaning().get(day_point_key(day, point), {})
+    done = state.get("done", {})
 
     lines = [f"<b>План на сегодня ({html_escape(point)})</b>", f"Зона ответственности: <b>{group}</b>"]
     for idx, t in tasks:
@@ -742,44 +1003,48 @@ async def plan_today_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     lines.append(f"Осталось: <b>{len(rem)}</b>")
 
-    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(user))
+    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(u))
 
 
-# ----------------- MARK TASKS -----------------
+# ----------------- MARK TASKS (with photo -> forward to CONTROL) -----------------
 
 async def mark_tasks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user = require_user(update)
-    if not can_use_feature(user, "mark"):
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return ConversationHandler.END
+    if not can_use_feature(u, "mark"):
         await q.edit_message_text("Нет доступа.")
-        return
+        return ConversationHandler.END
 
-    point = user.get("point")
+    point = u.get("point")
     if not point:
         await q.edit_message_text("Сначала выбери точку.", reply_markup=points_kb("set_point"))
-        return
+        return ConversationHandler.END
 
     day = today_key()
     group = get_user_group_for_today(update.effective_user.id, day, point)
-
     rem = remaining_task_indices(day, point, group)
+
     if not rem:
-        await q.edit_message_text("✅ Всё по твоей зоне закрыто. Отлично.", reply_markup=main_menu_kb(user))
-        # clear violation once resolved
-        clear_violation_for_user_slot(update.effective_user.id, "cleaning_pending")
+        await q.edit_message_text("✅ Всё по твоей зоне закрыто. Отлично.", reply_markup=main_menu_kb(u))
+        v_clear_for_user(update.effective_user.id, "cleaning_pending")
         return ConversationHandler.END
 
-    # build buttons for remaining tasks
-    cleaning = load_cleaning()[day_point_key(day, point)]
-    tasks = cleaning["tasks"]
+    state = load_cleaning().get(day_point_key(day, point), {})
+    tasks = state.get("tasks") or ensure_tasks_loaded(day, point)
+
     buttons = []
-    for idx in rem[:30]:
+    for idx in rem[:40]:
         title = tasks[idx]
         buttons.append([InlineKeyboardButton(title[:50], callback_data=f"do_task:{idx}")])
 
     await q.edit_message_text(
-        f"Выбери задачу, которую сделал (потом попросит фото). Зона: {group}",
+        f"Выбери задачу, которую сделал. Потом пришли фото.\nЗона: <b>{group}</b>",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     context.user_data["mark_point"] = point
@@ -791,8 +1056,7 @@ async def mark_tasks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pick_task_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data
-    idx = int(data.split(":", 1)[1])
+    idx = int(q.data.split(":", 1)[1])
     context.user_data["mark_idx"] = idx
     await q.edit_message_text("Теперь пришли 1 фото (после выполнения задачи).")
     return MARK_WAIT_PHOTO
@@ -804,7 +1068,7 @@ async def mark_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Нужно именно фото. Пришли фото ещё раз.")
         return MARK_WAIT_PHOTO
 
-    file_id = msg.photo[-1].file_id  # best quality
+    file_id = msg.photo[-1].file_id
     uid = update.effective_user.id
     users = load_users()
     name = user_name(users, uid)
@@ -812,70 +1076,58 @@ async def mark_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = context.user_data.get("mark_day", today_key())
     point = context.user_data.get("mark_point")
     group = context.user_data.get("mark_group", "A")
-    idx = int(context.user_data.get("mark_idx"))
+    idx = int(context.user_data.get("mark_idx", -1))
 
-    if not point:
-        await msg.reply_text("Сначала выбери точку.")
+    if not point or idx < 0:
+        await msg.reply_text("Фото получено, но сейчас бот не ждёт фото.\nНажми: ✅ Отметить выполненное → выбери задачу → пришли фото.")
         return ConversationHandler.END
 
-    # Enforce responsibility: user can only close tasks from their group (unless admin)
-    cleaning = load_cleaning()[day_point_key(day, point)]
-    task_group = cleaning["split"].get(str(idx), "A")
+    state = load_cleaning().get(day_point_key(day, point), {})
+    tasks = state.get("tasks") or ensure_tasks_loaded(day, point)
+    split = state.get("split") or {}
+
+    task_group = split.get(str(idx), "A")
     if group != "ALL" and task_group != group and not is_admin(uid):
         await msg.reply_text("⚠️ Это задача другой зоны. Закрывай только свои задачи.")
         return ConversationHandler.END
 
     mark_task_done(day, point, idx, uid, name, file_id)
 
-    # resolve violation flag for this slot if no remaining
+    # Forward to Control group (photo + caption)
+    if CONTROL_CHAT_ID:
+        try:
+            caption = (
+                f"🧹 Уборка закрыта\n"
+                f"Точка: {point}\n"
+                f"Зона: {task_group}\n"
+                f"Задача: {tasks[idx]}\n"
+                f"Сотрудник: {name} ({uid})\n"
+                f"Время: {now_tz().strftime('%Y-%m-%d %H:%M')}"
+            )
+            await context.bot.send_photo(chat_id=CONTROL_CHAT_ID, photo=file_id, caption=caption)
+        except Exception as e:
+            log.warning("Failed to forward cleaning photo to CONTROL: %s", e)
+
+    # Clear violation if zone finished
     if not remaining_task_indices(day, point, group):
-        clear_violation_for_user_slot(uid, "cleaning_pending")
+        v_clear_for_user(uid, "cleaning_pending")
 
     await msg.reply_text("✅ Принято. Задача закрыта с фото.")
-    # show menu
-    u = users.get(str(uid), {})
-    await msg.reply_text("Меню:", reply_markup=main_menu_kb(u))
+    await msg.reply_text("Меню:", reply_markup=main_menu_kb(users.get(str(uid), {})))
     return ConversationHandler.END
 
 
-# ----------------- VIOLATION (NO SPAM) -----------------
-
-def violation_key(slot_id: str, vtype: str) -> str:
-    return f"{slot_id}::{vtype}"
-
-
-def already_sent(slot_id: str, vtype: str) -> bool:
-    v = load_violations()
-    sent = v.get("sent", {})
-    return bool(sent.get(violation_key(slot_id, vtype)))
-
-
-def set_sent(slot_id: str, vtype: str, value: bool = True):
-    v = load_violations()
-    sent = v.setdefault("sent", {})
-    key = violation_key(slot_id, vtype)
-    if value:
-        sent[key] = now_tz().isoformat()
-    else:
-        sent.pop(key, None)
-    v["sent"] = sent
-    save_violations(v)
-
-
-def clear_violation_for_user_slot(uid: int, vtype: str):
-    slot = open_slot_for_user(uid)
-    if not slot:
-        return
-    set_sent(slot["id"], vtype, value=False)
-
-
-# ----------------- SLOT / TRANSFER / REPORT -----------------
+# ----------------- TRANSFER POINT (close slot without fin report) -----------------
 
 async def transfer_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user = require_user(update)
-    if not can_use_feature(user, "transfer"):
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return ConversationHandler.END
+    if not can_use_feature(u, "transfer"):
         await q.edit_message_text("Нет доступа.")
         return ConversationHandler.END
 
@@ -884,10 +1136,7 @@ async def transfer_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("У тебя нет открытого слота.")
         return ConversationHandler.END
 
-    await q.edit_message_text(
-        "Напиши коротко: кому передал точку / комментарий по смене.",
-        reply_markup=None,
-    )
+    await q.edit_message_text("Напиши коротко: кому передал точку / комментарий по смене.")
     return TRANSFER_WAIT_COMMENT
 
 
@@ -909,12 +1158,11 @@ async def transfer_wait_comment(update: Update, context: ContextTypes.DEFAULT_TY
     slots[slot["id"]] = slot
     save_slots(slots)
 
-    # notify control
     if CONTROL_CHAT_ID:
         try:
             await context.bot.send_message(
                 chat_id=CONTROL_CHAT_ID,
-                text=f"🔁 Передача точки: {slot['point']} | {name} ({uid})\nКомментарий: {text}",
+                text=f"🔁 Передача точки: {slot['point']} | {name} ({uid}) | {slot['start']}-{slot['end']} | зона {slot.get('group')}\nКомментарий: {text}",
             )
         except Exception:
             pass
@@ -924,34 +1172,81 @@ async def transfer_wait_comment(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-async def fin_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----------------- INCIDENT -----------------
+
+async def incident_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user = require_user(update)
-    if not can_use_feature(user, "report"):
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return ConversationHandler.END
+    if not can_use_feature(u, "incident"):
         await q.edit_message_text("Нет доступа.")
         return ConversationHandler.END
 
-    point = user.get("point")
+    await q.edit_message_text("Напиши инцидент/комментарий (можно 1 сообщением). Если надо — потом пришли фото.")
+    context.user_data["incident_waiting"] = True
+    return INCIDENT_WAIT
+
+
+async def incident_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    users = load_users()
+    name = user_name(users, uid)
+    u = users.get(str(uid), {})
+    point = u.get("point") or "(не выбрана)"
+
+    txt = (update.message.text or "").strip()
+    if CONTROL_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=CONTROL_CHAT_ID,
+                text=f"💬 Инцидент/комментарий\nТочка: {point}\nСотрудник: {name} ({uid})\nТекст: {txt}",
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text("✅ Принято.")
+    await update.message.reply_text("Меню:", reply_markup=main_menu_kb(u))
+    context.user_data.pop("incident_waiting", None)
+    return ConversationHandler.END
+
+
+# ----------------- FIN REPORT (only after close) -----------------
+
+async def fin_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        await q.edit_message_text("Нужно /start")
+        return ConversationHandler.END
+    if not can_use_feature(u, "report"):
+        await q.edit_message_text("Нет доступа.")
+        return ConversationHandler.END
+
+    point = u.get("point")
     if not point:
         await q.edit_message_text("Сначала выбери точку.", reply_markup=points_kb("set_point"))
         return ConversationHandler.END
 
-    # Gate: only after close time
     if not after_close_now(point):
         close_t = point_close_time(point).strftime("%H:%M")
         await q.edit_message_text(
             f"⛔ Фин. отчёт можно сдавать только после закрытия точки.\n"
             f"Для <b>{html_escape(point)}</b> это после <b>{close_t}</b>.",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_kb(user),
+            reply_markup=main_menu_kb(u),
         )
         return ConversationHandler.END
 
     day = today_key()
-    # start report flow
     context.user_data["r_point"] = point
     context.user_data["r_day"] = day
+    context.user_data["r_photos"] = []
 
     await q.edit_message_text(f"Фин. отчёт ({html_escape(point)}). Введи сумму НАЛИЧКА (число).", parse_mode=ParseMode.HTML)
     return REPORT_CASH
@@ -973,8 +1268,7 @@ async def report_cashless(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нужно число. Например 12345")
         return REPORT_CASHLESS
     context.user_data["r_cashless"] = float(t)
-    await update.message.reply_text("Пришли 1-2 фото чеков (можно одним сообщением). Начни с первого фото.")
-    context.user_data["r_photos"] = []
+    await update.message.reply_text("Пришли 1-2 фото чеков. Начни с первого фото.")
     return REPORT_PHOTO
 
 
@@ -989,15 +1283,11 @@ async def report_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos.append(file_id)
     context.user_data["r_photos"] = photos
 
-    if len(photos) < 2:
-        await msg.reply_text("✅ Принял. Если есть ещё фото чека — пришли второе. Если нет — напиши: ГОТОВО")
-        return REPORT_PHOTO
-
-    await msg.reply_text("✅ Принял 2 фото. Напиши: ГОТОВО")
+    await msg.reply_text("✅ Принял. Если есть ещё фото — пришли. Если нет — напиши: ГОТОВО")
     return REPORT_PHOTO
 
 
-async def report_photo_text_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def report_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (update.message.text or "").strip().lower() not in {"готово", "done", "ok"}:
         await update.message.reply_text("Если фото больше нет — напиши: ГОТОВО")
         return REPORT_PHOTO
@@ -1008,10 +1298,9 @@ async def report_photo_text_done(update: Update, context: ContextTypes.DEFAULT_T
 
     point = context.user_data.get("r_point")
     day = context.user_data.get("r_day", today_key())
-    cash = context.user_data.get("r_cash", 0.0)
-    cashless = context.user_data.get("r_cashless", 0.0)
+    cash = float(context.user_data.get("r_cash", 0.0))
+    cashless = float(context.user_data.get("r_cashless", 0.0))
     photos = context.user_data.get("r_photos", [])
-
     total = cash + cashless
 
     reports = load_reports()
@@ -1039,7 +1328,6 @@ async def report_photo_text_done(update: Update, context: ContextTypes.DEFAULT_T
         slots[slot["id"]] = slot
         save_slots(slots)
 
-    # notify control
     if CONTROL_CHAT_ID:
         try:
             await context.bot.send_message(
@@ -1055,22 +1343,27 @@ async def report_photo_text_done(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-        # forward photo ids are not accessible here; admin can open in Telegram if needed.
+        # forward check photos too
+        for i, fid in enumerate(photos, start=1):
+            try:
+                await context.bot.send_photo(chat_id=CONTROL_CHAT_ID, photo=fid, caption=f"🧾 Чек {i} | {point} | {day} | {name}")
+            except Exception:
+                pass
 
     await update.message.reply_text("✅ Фин. отчёт принят. Спасибо.")
     await update.message.reply_text("Меню:", reply_markup=main_menu_kb(users.get(str(uid), {})))
     return ConversationHandler.END
 
 
-# ----------------- REMINDER JOB (no spam) -----------------
+# ----------------- REMINDER JOB -----------------
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     slots = load_slots()
     if not slots:
         return
 
-    users = load_users()
     day = today_key()
+    users = load_users()
 
     for slot_id, slot in list(slots.items()):
         if slot.get("status") != "open":
@@ -1081,35 +1374,52 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         group = slot.get("group", "A")
 
         u = users.get(str(uid))
-        if not u or not is_active(u):
+        if not u or not is_active_user(u):
             continue
 
-        # Only remind about cleaning tasks (and only once per violation)
+        # only during point working hours (so we don't ping at night)
+        if point and not is_within_point_hours(point):
+            continue
+
         rem = remaining_task_indices(day, point, group)
         if rem:
-            if not already_sent(slot_id, "cleaning_pending"):
-                # message once
-                cleaning = load_cleaning()[day_point_key(day, point)]
-                tasks = cleaning["tasks"]
-                # show a short list of remaining tasks (max 5)
+            # First time: strict "косяк" once
+            if not v_already_sent(slot_id, "cleaning_pending"):
+                state = load_cleaning().get(day_point_key(day, point), {})
+                tasks = state.get("tasks") or ensure_tasks_loaded(day, point)
                 sample = [tasks[i] for i in rem[:5]]
-                msg = (
+                strict_msg = (
                     "⚠️ Косяк я снял (не закрыта уборка по твоей зоне) и доложу руководителю.\n"
                     f"Точка: {point}\n"
                     f"Зона: {group}\n"
-                    "Осталось:\n• " + "\n• ".join(sample[:5])
+                    "Осталось:\n• " + "\n• ".join(sample)
                 )
                 try:
-                    await context.bot.send_message(chat_id=uid, text=msg)
+                    await context.bot.send_message(chat_id=uid, text=strict_msg)
                 except Exception:
                     pass
-                set_sent(slot_id, "cleaning_pending", True)
+                v_set_sent(slot_id, "cleaning_pending", strict=True, value=True)
+
+            # Then: gentle reminders every 30 min (no strict text repeats)
+            state = load_cleaning().get(day_point_key(day, point), {})
+            tasks = state.get("tasks") or ensure_tasks_loaded(day, point)
+            sample = [tasks[i] for i in rem[:3]]
+            gentle_msg = (
+                f"⏰ Напоминание: осталось {len(rem)} задач по уборке (твоя зона {group}).\n"
+                "Например:\n• " + "\n• ".join(sample)
+            )
+            try:
+                await context.bot.send_message(chat_id=uid, text=gentle_msg)
+            except Exception:
+                pass
+            v_set_sent(slot_id, "cleaning_pending", strict=False, value=True)
         else:
-            # resolved -> clear, so if it appears again later (rare), it can notify again
-            set_sent(slot_id, "cleaning_pending", False)
+            # resolved -> clear flags
+            v_set_sent(slot_id, "cleaning_pending", strict=True, value=False)
+            v_set_sent(slot_id, "cleaning_pending", strict=False, value=False)
 
 
-# ----------------- ADMIN (simple) -----------------
+# ----------------- ADMIN -----------------
 
 async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1134,8 +1444,7 @@ async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("Используй: /block 123456")
@@ -1147,14 +1456,14 @@ async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пользователь не найден.")
         return
     u["active"] = False
+    u["pending"] = False
     users[str(tid)] = u
     save_users(users)
     await update.message.reply_text(f"✅ Заблокирован {tid}")
 
 
 async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("Используй: /unblock 123456")
@@ -1166,14 +1475,14 @@ async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пользователь не найден.")
         return
     u["active"] = True
+    u["pending"] = False
     users[str(tid)] = u
     save_users(users)
     await update.message.reply_text(f"✅ Разблокирован {tid}")
 
 
 async def promote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+    if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("Используй: /promote 123456")
@@ -1185,27 +1494,76 @@ async def promote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пользователь не найден.")
         return
     u["limited"] = False
-    u["confirmed"] = True
+    u["active"] = True
+    u["pending"] = False
     users[str(tid)] = u
     save_users(users)
     await update.message.reply_text(f"✅ Полный доступ выдан {tid}")
 
 
-# ----------------- ROUTING -----------------
+# ----------------- FALLBACK HANDLERS -----------------
 
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # if user types random text, just show menu (non-intrusive)
-    user = require_user(update)
-    if user and is_active(user):
-        await update.message.reply_text("Меню:", reply_markup=main_menu_kb(user))
+async def photo_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Photo received when bot isn't waiting for a photo in a task/report flow."""
+    msg: Message = update.message
+    if not msg.photo:
+        return
+    file_id = msg.photo[-1].file_id
+    uid = update.effective_user.id
+    users = load_users()
+    u = users.get(str(uid))
+    name = user_name(users, uid)
+    point = (u or {}).get("point") or "(не выбрана)"
+
+    await msg.reply_text(
+        "Фото получено, но сейчас бот не ждёт фото.\n"
+        "Правильно так:\n"
+        "1) ✅ Отметить выполненное\n"
+        "2) Выбрать задачу\n"
+        "3) Прислать фото"
+    )
+
+    # Still forward to Control as "unlinked photo" to avoid losing evidence
+    if CONTROL_CHAT_ID:
+        try:
+            caption = (
+                f"📷 Фото без привязки к задаче\n"
+                f"Точка: {point}\n"
+                f"Сотрудник: {name} ({uid})\n"
+                f"Время: {now_tz().strftime('%Y-%m-%d %H:%M')}"
+            )
+            await context.bot.send_photo(chat_id=CONTROL_CHAT_ID, photo=file_id, caption=caption)
+        except Exception:
+            pass
+
+
+async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if u and is_active_user(u):
+        await update.message.reply_text("Меню:", reply_markup=main_menu_kb(u))
+    elif u and is_pending_user(u):
+        await update.message.reply_text("⏳ Ты ожидаешь одобрения. Дождись сообщения от бота.")
     else:
         await update.message.reply_text("Нужно /start")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled exception", exc_info=context.error)
+    # Don't spam users; only reply in private chats
+    try:
+        if isinstance(update, Update) and update.effective_chat and update.effective_chat.type == "private":
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Ошибка. Попробуй ещё раз.")
+    except Exception:
+        pass
+
+
+# ----------------- BUILD APP -----------------
+
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # conversations
+    # Registration conversation
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_cmd)],
         states={
@@ -1215,6 +1573,19 @@ def build_app() -> Application:
         fallbacks=[],
     )
 
+    # Slot conversation
+    slot_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(open_slot_cb, pattern=r"^open_slot$")],
+        states={
+            SLOT_POINT: [CallbackQueryHandler(slot_point_cb, pattern=r"^slot_point:")],
+            SLOT_MODE: [CallbackQueryHandler(slot_mode_cb, pattern=r"^slot_mode:")],
+            SLOT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, slot_time_text)],
+        },
+        fallbacks=[],
+        per_message=False,
+    )
+
+    # Mark tasks conversation
     mark_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(mark_tasks_cb, pattern=r"^mark_tasks$")],
         states={
@@ -1225,15 +1596,23 @@ def build_app() -> Application:
         per_message=False,
     )
 
+    # Transfer point conversation
     transfer_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(transfer_point_cb, pattern=r"^transfer_point$")],
-        states={
-            TRANSFER_WAIT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_wait_comment)]
-        },
+        states={TRANSFER_WAIT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_wait_comment)]},
         fallbacks=[],
         per_message=False,
     )
 
+    # Incident conversation
+    incident_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(incident_cb, pattern=r"^incident$")],
+        states={INCIDENT_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, incident_wait)]},
+        fallbacks=[],
+        per_message=False,
+    )
+
+    # Report conversation
     report_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(fin_report_cb, pattern=r"^fin_report$")],
         states={
@@ -1241,31 +1620,44 @@ def build_app() -> Application:
             REPORT_CASHLESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_cashless)],
             REPORT_PHOTO: [
                 MessageHandler(filters.PHOTO, report_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, report_photo_text_done),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_done),
             ],
         },
         fallbacks=[],
         per_message=False,
     )
 
-    # callbacks
     app.add_handler(reg_conv)
+
+    # callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^choose_point$"))
     app.add_handler(CallbackQueryHandler(set_point_cb, pattern=r"^set_point:"))
+    app.add_handler(slot_conv)
     app.add_handler(CallbackQueryHandler(plan_today_cb, pattern=r"^plan_today$"))
     app.add_handler(mark_conv)
     app.add_handler(transfer_conv)
     app.add_handler(report_conv)
-    app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^admin$"))
+    app.add_handler(incident_conv)
 
-    # admin commands
+    # approval callbacks
+    app.add_handler(CallbackQueryHandler(approve_user_cb, pattern=r"^approve_user:\d+$"))
+    app.add_handler(CallbackQueryHandler(deny_user_cb, pattern=r"^deny_user:\d+$"))
+
+    # admin
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^admin$"))
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("block", block_cmd))
     app.add_handler(CommandHandler("unblock", unblock_cmd))
     app.add_handler(CommandHandler("promote", promote_cmd))
 
-    # fallback
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
+    # Photo fallback (must be AFTER conv handlers so it doesn't steal photos when bot is waiting)
+    app.add_handler(MessageHandler(filters.PHOTO, photo_fallback))
+
+    # Text fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_fallback))
+
+    # errors
+    app.add_error_handler(error_handler)
 
     # job queue reminders
     if app.job_queue:
