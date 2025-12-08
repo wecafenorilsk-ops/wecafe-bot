@@ -702,10 +702,14 @@ async def reg_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users(users)
 
         if CONTROL_CHAT_ID:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 Выдать полный доступ", callback_data=f"promote_user:{uid}"),
+            ]])
             try:
                 await context.bot.send_message(
                     chat_id=CONTROL_CHAT_ID,
-                    text=f"✅ Автоактивация: {name} ({uid}) [09:00–15:00, ограниченный доступ]"
+                    text=f"✅ Автоактивация: {name} ({uid}) [09:00–15:00, ограниченный доступ]\nНажми кнопку ниже, чтобы дать полный доступ.",
+                    reply_markup=kb
                 )
             except Exception:
                 pass
@@ -768,7 +772,7 @@ async def approve_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     u["active"] = True
     u["pending"] = False
-    u["limited"] = True
+    u["limited"] = False
     u["approved_at"] = now_tz().isoformat()
     u["approved_by"] = admin_id
     users[str(uid)] = u
@@ -781,6 +785,38 @@ async def approve_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.edit_message_text(f"✅ Одобрено: {u.get('name')} ({uid})")
 
+
+
+
+async def promote_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    admin_id = update.effective_user.id
+    if not is_admin(admin_id):
+        await q.edit_message_text("Нет прав.")
+        return
+    uid = int(q.data.split(":", 1)[1])
+
+    users = load_users()
+    u = users.get(str(uid))
+    if not u:
+        await q.edit_message_text("Пользователь не найден.")
+        return
+
+    u["limited"] = False
+    u["active"] = True
+    u["pending"] = False
+    u["promoted_at"] = now_tz().isoformat()
+    u["promoted_by"] = admin_id
+    users[str(uid)] = u
+    save_users(users)
+
+    try:
+        await context.bot.send_message(chat_id=uid, text="🚀 Тебе выдали полный доступ. Напиши /start")
+    except Exception:
+        pass
+
+    await q.edit_message_text(f"🚀 Полный доступ: {u.get('name')} ({uid})")
 
 async def deny_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1642,6 +1678,7 @@ def build_app() -> Application:
     # approval callbacks
     app.add_handler(CallbackQueryHandler(approve_user_cb, pattern=r"^approve_user:\d+$"))
     app.add_handler(CallbackQueryHandler(deny_user_cb, pattern=r"^deny_user:\d+$"))
+    app.add_handler(CallbackQueryHandler(promote_user_cb, pattern=r"^promote_user:\d+$"))
 
     # admin
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^admin$"))
