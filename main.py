@@ -7,10 +7,8 @@ WeCafe Cleaning & Shift Bot (Telegram)
 - End-of-slot finance report + 1-2 receipt photos
 - Reminders every N minutes + "Косяк снял..." after overdue
 - Daily summary at END_OF_DAY_TIME to CONTROL group
-
 Python: 3.12+
 PTB: python-telegram-bot[job-queue]==21.6
-Render: Web Service needs open port -> built-in health server on $PORT
 """
 
 import os
@@ -23,7 +21,6 @@ from io import StringIO
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 from dotenv import load_dotenv
@@ -45,30 +42,14 @@ from telegram.ext import (
     filters,
 )
 
-# -------------------- Render Health Server (IMPORTANT) --------------------
-# Render Web Service обязательно должен увидеть открытый порт.
-# Этот мини-сервер отвечает "ok" на любой GET запрос.
-def _start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, format, *args):
-            return  # чтобы не засорять логи
-
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-threading.Thread(target=_start_health_server, daemon=True).start()
-
 # -------------------- Logging --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)
+# --- Security: hide Telegram token from logs (httpx prints request URLs) ---
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("wecafe-bot")
 
@@ -160,7 +141,7 @@ def init_db():
             " start_ts INTEGER NOT NULL,"
             " planned_end_ts INTEGER NOT NULL,"
             " closed_ts INTEGER,"
-            " status TEXT NOT NULL,"
+            " status TEXT NOT NULL,"  # open/closed
             " last_reminder_ts INTEGER,"
             " last_koasyk_ts INTEGER,"
             " handoff_note TEXT"
@@ -172,7 +153,7 @@ def init_db():
             " slot_id INTEGER NOT NULL,"
             " task_id TEXT NOT NULL,"
             " task_name TEXT NOT NULL,"
-            " status TEXT NOT NULL,"
+            " status TEXT NOT NULL,"  # pending/wait_photo/done
             " done_ts INTEGER,"
             " photo_file_id TEXT"
             ")"
@@ -223,16 +204,6 @@ class ScheduleCache:
 SCHEDULE_CACHE = ScheduleCache()
 
 
-def _decode_csv_bytes(raw: bytes) -> str:
-    # чтобы не было "Ð¨ÐºÐ°ÑÑ..." — пробуем несколько кодировок
-    for enc in ("utf-8-sig", "utf-8", "cp1251"):
-        try:
-            return raw.decode(enc)
-        except Exception:
-            pass
-    return raw.decode("utf-8", errors="replace")
-
-
 def fetch_schedule_rows() -> list[dict]:
     # Cache 5 minutes
     if SCHEDULE_CACHE.rows is not None and (time.time() - SCHEDULE_CACHE.fetched_at) < 300:
@@ -242,18 +213,12 @@ def fetch_schedule_rows() -> list[dict]:
         raise RuntimeError("SCHEDULE_CSV_URL is not set")
 
     r = requests.get(SCHEDULE_CSV_URL, timeout=25)
-
-    # Явно ловим 401/403 и даём нормальный текст
-    if r.status_code in (401, 403):
-        raise RuntimeError(
-            "401/403: Таблица недоступна. Сделай Google Sheet публичным: "
-            "Share → Anyone with the link → Viewer. "
-            "Или используй правильную export-ссылку."
-        )
-
     r.raise_for_status()
 
-    csv_text = _decode_csv_bytes(r.content)
+    # Force UTF-8 decoding for Cyrillic
+    r.encoding = 'utf-8'
+
+    csv_text = r.content.decode('utf-8-sig', errors='replace')
     reader = csv.DictReader(StringIO(csv_text))
     rows = list(reader)
     if not rows:
@@ -268,6 +233,7 @@ def fetch_schedule_rows() -> list[dict]:
             norm[kk] = vv
         norm_rows.append(norm)
 
+    # Required minimal columns
     for col in ["task_id", "task_name", "point"]:
         if col not in norm_rows[0]:
             raise RuntimeError(f"Missing column in schedule: {col}")
@@ -286,7 +252,9 @@ def get_today_tasks(point: str) -> list[dict]:
         if v is None:
             return False
         s = str(v).strip().lower()
-        return s in ("1", "true", "yes", "y", "да")
+        if s in ("1", "true", "yes", "y", "да"):
+            return True
+        return False
 
     tasks: list[dict] = []
     for row in rows:
@@ -307,6 +275,7 @@ def get_today_tasks(point: str) -> list[dict]:
         tasks.append({"task_id": task_id, "task_name": name})
 
     return tasks
+
 
 
 def _point_hours(point: str) -> tuple[dtime, dtime]:
@@ -668,6 +637,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full_name = context.user_data.get("reg_name", "Без имени")
         user_set_pending(u.id, full_name)
 
+        # Send approval request to control (NO Markdown -> safe)
         if CONTROL_CHAT_ID != 0:
             try:
                 kb = InlineKeyboardMarkup([[
@@ -716,6 +686,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("incident_wait_photo", None)
         context.user_data.pop("incident_text", None)
 
+        # Notify control
         if CONTROL_CHAT_ID != 0:
             try:
                 await context.bot.send_message(
@@ -839,7 +810,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"⛔ Отклонён tg_id={tg_id}")
         return
 
-    # Set point
+    # Set point (for plan, etc.)
     if data.startswith("setpoint:"):
         point = data.split(":", 1)[1]
         if point not in POINTS:
@@ -849,7 +820,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Точка выбрана: {point}\nТеперь можно открыть 📋 План сегодня.")
         return
 
-    # Start slot
+    # Start slot flow
     if data.startswith("point:"):
         point = data.split(":", 1)[1]
         if point not in POINTS:
@@ -866,7 +837,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
         )
         return
-
     if data.startswith("full:"):
         point = data.split(":", 1)[1]
         if point not in POINTS:
@@ -988,7 +958,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["close_wait"] = "comment"
         await update.message.reply_text("Напиши комментарий по слоту (можно 'всё ок'):")
         return CLOSE_COMMENT
-
     await update.message.reply_text("Фото получено, но сейчас бот не ждёт фото.", reply_markup=employee_menu())
 
 
@@ -1070,6 +1039,7 @@ async def close_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shift_totals_upsert(slot_id, dep, cash, card, photo1, photo2, comment)
     slot_close(slot_id)
 
+    # Slot + task stats
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1122,6 +1092,7 @@ async def close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Jobs (reminders / summary) --------------------
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    # Find all open slots
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1138,6 +1109,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         slot_id = int(s["id"])
         planned_end = int(s["planned_end_ts"])
 
+        # Task stats
         with DB_LOCK:
             conn = db()
             cur = conn.cursor()
@@ -1148,6 +1120,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         pending = int(stats.get("pending", 0))
         waitp = int(stats.get("wait_photo", 0))
 
+        # Regular reminder
         last_rem = int(s["last_reminder_ts"] or 0)
         if now - last_rem >= REMINDER_INTERVAL_MIN * 60:
             if pending > 0 or waitp > 0:
@@ -1160,6 +1133,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
             slot_set_reminder_ts(slot_id, "last_reminder_ts", now)
 
+        # Overdue -> "Косяк снял..."
         if now > planned_end:
             reasons = []
             if pending > 0:
@@ -1365,7 +1339,10 @@ async def send_week_report(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
         disc = (done_tasks / total_tasks * 100.0) if total_tasks > 0 else 0.0
 
         koasyk_cnt = int(ko_rows.get(tg_id, 0))
-        combined.append({"name": name, "revph": revph, "disc": disc, "done": done_tasks, "total": total_tasks, "koasyk": koasyk_cnt})
+
+        combined.append(
+            {"name": name, "revph": revph, "disc": disc, "done": done_tasks, "total": total_tasks, "koasyk": koasyk_cnt}
+        )
 
     if not combined:
         await context.bot.send_message(to_chat, "🧾 Отчёт недели: нет данных.")
@@ -1390,6 +1367,7 @@ async def send_week_report(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
     await context.bot.send_message(to_chat, "\n".join(lines))
 
 
+
 # -------------------- Custom slot time flow --------------------
 async def slot_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     point = context.user_data.get("slot_point")
@@ -1411,8 +1389,9 @@ async def slot_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SLOT_TIME_START
 
     start_ts = _ts_today_at(t_start)
+    # Не даём старт в далёком будущем
     if start_ts > now_ts() + 10 * 60:
-        await update.message.reply_text("Начало получилось в будущем. Введи время ещё раз.")
+        await update.message.reply_text("Начало получилось в будущем. Начни слот ближе к старту и введи время ещё раз.")
         return SLOT_TIME_START
 
     context.user_data["slot_start_ts"] = start_ts
@@ -1447,9 +1426,11 @@ async def slot_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SLOT_TIME_END
 
     if now_ts() >= end_ts:
-        await update.message.reply_text("Окончание уже в прошлом. Введи окончание ещё раз:")
+        await update.message.reply_text("Окончание уже в прошлом. Проверь время и введи окончание ещё раз:")
         return SLOT_TIME_END
 
+    # Create slot
+    # Protect against duplicate open slot
     if slot_get_open(update.effective_user.id):
         await update.message.reply_text("У тебя уже есть открытый слот.", reply_markup=employee_menu())
         context.user_data.clear()
@@ -1464,7 +1445,7 @@ async def slot_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
-        f"Слот начат.\nТочка: {point}\nС: {datetime.fromtimestamp(int(start_ts), TZ).strftime('%H:%M')}\nДо: {datetime.fromtimestamp(int(end_ts), TZ).strftime('%H:%M')}\n\nДальше: ✅ Отметить выполненное",
+        f"Слот начат.\\nТочка: {point}\\nС: {datetime.fromtimestamp(int(start_ts), TZ).strftime('%H:%M')}\\nДо: {datetime.fromtimestamp(int(end_ts), TZ).strftime('%H:%M')}\\n\\nДальше: ✅ Отметить выполненное",
         reply_markup=employee_menu(),
     )
     context.user_data.clear()
@@ -1479,7 +1460,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Build app --------------------
 def build_app() -> Application:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required (.env / Render env vars)")
+        raise RuntimeError("BOT_TOKEN is required (.env)")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1503,6 +1484,7 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", close_cancel)],
         allow_reentry=True,
     )
+
 
     slot_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_callback, pattern=r"^custom:")],
@@ -1529,6 +1511,7 @@ def build_app() -> Application:
 
     app.add_error_handler(on_error)
 
+    # Jobs
     if app.job_queue is None:
         raise RuntimeError('JobQueue not available. Install: pip install "python-telegram-bot[job-queue]==21.6"')
 
@@ -1540,8 +1523,7 @@ def build_app() -> Application:
 
 def main():
     init_db()
-    # drop_pending_updates помогает, если были старые апдейты
-    build_app().run_polling(close_loop=False, drop_pending_updates=True)
+    build_app().run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
