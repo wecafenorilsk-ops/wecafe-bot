@@ -1,48 +1,95 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-WeCafe Cleaning & Shift Bot (Telegram)
-- Self-registration by access code
-- Admin approval in CONTROL group
-- Slot-based cleaning tasks + photo proof after each task
-- End-of-slot finance report + 1-2 receipt photos
-- Reminders every N minutes + "Косяк снял..." after overdue
-- Daily summary at END_OF_DAY_TIME to CONTROL group
-Python: 3.12+
-PTB: python-telegram-bot[job-queue]==21.6
+WeCafe Cleaning Bot (Telegram) — polling mode (python-telegram-bot 21.x)
+
+Key features implemented for your request:
+- Cleaning tasks are for the whole day/point, but RESPONSIBILITY is split into 2 zones (A/B) when two workers cover a day.
+- If a worker works the whole shift ("Смена целиком"), they get ALL tasks.
+- Reminders every 30 minutes stay, BUT the same "косяк" is sent only ONCE per violation per slot (no repeats every 30 min).
+- End-of-day financial report is allowed only after point closing time:
+    69 Параллель, Арена: after 22:00
+    Кафе Музей: after 19:00
+- Includes a tiny HTTP health server for Render Web Service port scan (returns "ok").
+- Suppresses httpx/httpcore INFO logs so BOT_TOKEN doesn't appear in logs.
 """
 
-import os
+import asyncio
 import csv
-import time
-import sqlite3
-import threading
+import json
 import logging
-from io import StringIO
+import os
+import re
+import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dtime
-from zoneinfo import ZoneInfo
+from datetime import datetime, time, timedelta, date
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import StringIO
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    ReplyKeyboardRemove,
+    Message,
 )
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
     ConversationHandler,
+    MessageHandler,
     filters,
 )
 
-# -------------------- Logging --------------------
+# ----------------- ENV -----------------
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
+
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "0").strip() or "0")
+
+ACCESS_CODE = os.getenv("ACCESS_CODE", "").strip()
+if not ACCESS_CODE:
+    ACCESS_CODE = "wecafe2026"  # safe default if you forgot
+
+TZ_NAME = os.getenv("TZ", "Asia/Krasnoyarsk").strip()  # Norilsk
+TZ = ZoneInfo(TZ_NAME)
+
+SCHEDULE_CSV_URL = os.getenv("SCHEDULE_CSV_URL", "").strip()
+
+END_OF_DAY_TIME = os.getenv("END_OF_DAY_TIME", "22:30").strip()  # daily admin summary time, not closing time gate
+REMINDER_INTERVAL_MIN = int(os.getenv("REMINDER_INTERVAL_MIN", "30").strip() or "30")
+
+# Auto-approve window (not the focus right now, but kept for continuity)
+AUTO_APPROVE_START = os.getenv("AUTO_APPROVE_START", "09:00").strip()
+AUTO_APPROVE_END = os.getenv("AUTO_APPROVE_END", "15:00").strip()
+
+PORT = int(os.getenv("PORT", "10000").strip() or "10000")
+
+POINTS = ["69 Параллель", "Арена", "Кафе Музей"]
+
+POINT_HOURS = {
+    "69 Параллель": (time(10, 0), time(22, 0)),
+    "Арена": (time(10, 0), time(22, 0)),
+    "Кафе Музей": (time(9, 0), time(19, 0)),
+}
+
+# ----------------- LOGGING -----------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -52,1479 +99,1188 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-logger = logging.getLogger("wecafe-bot")
-
-# -------------------- Env --------------------
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-ADMIN_IDS = set()
-_raw_admins = os.getenv("ADMIN_IDS", "").replace(" ", "")
-if _raw_admins:
-    for x in _raw_admins.split(","):
-        if x.strip():
-            ADMIN_IDS.add(int(x.strip()))
-
-CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "0").strip() or "0")
-ACCESS_CODE = os.getenv("ACCESS_CODE", "").strip()
-SCHEDULE_CSV_URL = os.getenv("SCHEDULE_CSV_URL", "").strip()
-
-# Norilsk timezone (Asia/Krasnoyarsk is correct for Norilsk)
-try:
-    TZ = ZoneInfo(os.getenv("TZ", "Asia/Krasnoyarsk").strip() or "Asia/Krasnoyarsk")
-except Exception as e:
-    logger.exception("TZ error, fallback to UTC: %s", e)
-    TZ = ZoneInfo("UTC")
-
-END_OF_DAY_TIME = os.getenv("END_OF_DAY_TIME", "22:30").strip() or "22:30"
-REMINDER_INTERVAL_MIN = int(os.getenv("REMINDER_INTERVAL_MIN", "30").strip() or "30")
-
-POINTS = ["69 Параллель", "Арена", "Кафе Музей"]
-
-# Рабочие часы точек (Норильск)
-WORK_HOURS = {
-    "69 Параллель": ("10:00", "22:00"),
-    "Арена": ("10:00", "22:00"),
-    "Кафе Музей": ("09:00", "19:00"),
-}
-
-# -------------------- DB --------------------
-DB_PATH = "bot.db"
-DB_LOCK = threading.Lock()
+log = logging.getLogger("wecafe-bot")
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ----------------- STORAGE -----------------
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+USERS_PATH = os.path.join(DATA_DIR, "users.json")
+SLOTS_PATH = os.path.join(DATA_DIR, "slots.json")
+CLEANING_PATH = os.path.join(DATA_DIR, "cleaning.json")
+VIOLATIONS_PATH = os.path.join(DATA_DIR, "violations.json")
+REPORTS_PATH = os.path.join(DATA_DIR, "reports.json")
 
 
-def now_ts() -> int:
-    return int(time.time())
+def _load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        log.error("Failed to load %s: %s", path, e)
+        return default
 
 
-def now_dt() -> datetime:
+def _save_json(path: str, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_users() -> Dict[str, dict]:
+    return _load_json(USERS_PATH, {})
+
+
+def save_users(users: Dict[str, dict]) -> None:
+    _save_json(USERS_PATH, users)
+
+
+def load_slots() -> Dict[str, dict]:
+    return _load_json(SLOTS_PATH, {})
+
+
+def save_slots(slots: Dict[str, dict]) -> None:
+    _save_json(SLOTS_PATH, slots)
+
+
+def load_cleaning() -> Dict[str, dict]:
+    # per day+point state: tasks, split_map, done
+    return _load_json(CLEANING_PATH, {})
+
+
+def save_cleaning(cleaning: Dict[str, dict]) -> None:
+    _save_json(CLEANING_PATH, cleaning)
+
+
+def load_violations() -> Dict[str, dict]:
+    # per slot: which violation keys already sent
+    return _load_json(VIOLATIONS_PATH, {})
+
+
+def save_violations(v: Dict[str, dict]) -> None:
+    _save_json(VIOLATIONS_PATH, v)
+
+
+def load_reports() -> Dict[str, dict]:
+    # end of day per date+point report
+    return _load_json(REPORTS_PATH, {})
+
+
+def save_reports(r: Dict[str, dict]) -> None:
+    _save_json(REPORTS_PATH, r)
+
+
+# ----------------- HEALTH SERVER (Render) -----------------
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # silence default http server logs
+        return
+
+
+def start_health_server():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        log.info("Health server listening on port %s", PORT)
+    except Exception as e:
+        log.error("Health server failed: %s", e)
+
+
+# ----------------- HELPERS -----------------
+
+def now_tz() -> datetime:
     return datetime.now(TZ)
 
 
-def parse_hhmm(s: str) -> dtime:
-    hh, mm = s.split(":")
-    return dtime(hour=int(hh), minute=int(mm))
+def today_key() -> str:
+    return now_tz().date().isoformat()
+
+
+def day_point_key(day: str, point: str) -> str:
+    return f"{day}::{point}"
 
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def init_db():
-    """Create all tables. Uses single-line SQL strings (no triple quotes)."""
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            " tg_id INTEGER PRIMARY KEY,"
-            " full_name TEXT NOT NULL,"
-            " status TEXT NOT NULL,"
-            " created_at INTEGER NOT NULL,"
-            " approved_by INTEGER,"
-            " last_point TEXT,"
-            " pending_task_id INTEGER"
-            ")"
-        )
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS slots ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " tg_id INTEGER NOT NULL,"
-            " point TEXT NOT NULL,"
-            " start_ts INTEGER NOT NULL,"
-            " planned_end_ts INTEGER NOT NULL,"
-            " closed_ts INTEGER,"
-            " status TEXT NOT NULL,"  # open/closed
-            " last_reminder_ts INTEGER,"
-            " last_koasyk_ts INTEGER,"
-            " handoff_note TEXT"
-            ")"
-        )
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS slot_tasks ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " slot_id INTEGER NOT NULL,"
-            " task_id TEXT NOT NULL,"
-            " task_name TEXT NOT NULL,"
-            " status TEXT NOT NULL,"  # pending/wait_photo/done
-            " done_ts INTEGER,"
-            " photo_file_id TEXT"
-            ")"
-        )
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS shift_totals ("
-            " slot_id INTEGER PRIMARY KEY,"
-            " deposit REAL,"
-            " cash REAL,"
-            " card REAL,"
-            " total REAL,"
-            " receipt_photo1 TEXT,"
-            " receipt_photo2 TEXT,"
-            " comment TEXT"
-            ")"
-        )
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS incidents ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " tg_id INTEGER NOT NULL,"
-            " slot_id INTEGER,"
-            " point TEXT,"
-            " ts INTEGER NOT NULL,"
-            " text TEXT NOT NULL,"
-            " photo_file_id TEXT"
-            ")"
-        )
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS koasyk_events ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " slot_id INTEGER NOT NULL,"
-            " ts INTEGER NOT NULL,"
-            " reason TEXT NOT NULL"
-            ")"
-        )
-
-        conn.commit()
-        conn.close()
+def parse_hhmm(s: str) -> time:
+    m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{2})\s*$", s)
+    if not m:
+        raise ValueError("bad time")
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise ValueError("bad time")
+    return time(h, mi)
 
 
-# -------------------- Schedule (Google Sheets CSV) --------------------
-@dataclass
-class ScheduleCache:
-    fetched_at: float = 0.0
-    rows: list[dict] | None = None
+def in_auto_approve_window(dt: datetime) -> bool:
+    try:
+        start = parse_hhmm(AUTO_APPROVE_START)
+        end = parse_hhmm(AUTO_APPROVE_END)
+    except Exception:
+        return True
+    st = dt.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+    en = dt.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+    return st <= dt <= en
 
 
-SCHEDULE_CACHE = ScheduleCache()
+def point_close_time(point: str) -> time:
+    return POINT_HOURS.get(point, (time(10, 0), time(22, 0)))[1]
 
 
-def fetch_schedule_rows() -> list[dict]:
-    # Cache 5 minutes
-    if SCHEDULE_CACHE.rows is not None and (time.time() - SCHEDULE_CACHE.fetched_at) < 300:
-        return SCHEDULE_CACHE.rows
+def point_open_time(point: str) -> time:
+    return POINT_HOURS.get(point, (time(10, 0), time(22, 0)))[0]
+
+
+def after_close_now(point: str) -> bool:
+    ct = point_close_time(point)
+    dt = now_tz()
+    close_dt = dt.replace(hour=ct.hour, minute=ct.minute, second=0, microsecond=0)
+    return dt >= close_dt
+
+
+def slot_duration_minutes(start: time, end: time) -> int:
+    # assume same day
+    dt = now_tz().date()
+    s = datetime(dt.year, dt.month, dt.day, start.hour, start.minute, tzinfo=TZ)
+    e = datetime(dt.year, dt.month, dt.day, end.hour, end.minute, tzinfo=TZ)
+    if e < s:
+        e += timedelta(days=1)
+    return int((e - s).total_seconds() // 60)
+
+
+def shift_duration_minutes(point: str) -> int:
+    return slot_duration_minutes(point_open_time(point), point_close_time(point))
+
+
+def safe_md(text: str) -> str:
+    # We use HTML parse mode by default to avoid markdown entity issues
+    return text
+
+
+def html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+# ----------------- SCHEDULE LOADING -----------------
+
+def fetch_schedule_csv() -> str:
+    if not SCHEDULE_CSV_URL:
+        raise RuntimeError("SCHEDULE_CSV_URL is empty")
+    resp = requests.get(SCHEDULE_CSV_URL, timeout=25)
+    resp.raise_for_status()
+    return resp.text
+
+
+def detect_and_fix_text(s: str) -> str:
+    # Sometimes Google CSV is utf-8 but read incorrectly elsewhere.
+    # Here we just return as-is; PTB messages are UTF-8.
+    return s
+
+
+def parse_schedule_tasks_for_today(schedule_csv_text: str, point: str, day: date) -> List[str]:
+    """
+    Expected CSV layout (simple):
+    columns: day, point, task
+    where day is YYYY-MM-DD or day-of-month number.
+    If your Google sheet differs, adapt this function.
+    """
+    data = schedule_csv_text
+    # Try to handle possible encoding artifacts
+    if "Ð" in data or "Ñ" in data:
+        # likely double-decoded; attempt to fix from latin-1 -> utf-8
+        try:
+            data = data.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    f = StringIO(data)
+    reader = csv.DictReader(f)
+    out = []
+    day_iso = day.isoformat()
+    day_num = str(day.day)
+
+    for row in reader:
+        r_day = (row.get("day") or row.get("date") or row.get("день") or row.get("Дата") or "").strip()
+        r_point = (row.get("point") or row.get("точка") or row.get("Точка") or "").strip()
+        r_task = (row.get("task") or row.get("задача") or row.get("Задача") or "").strip()
+
+        if not r_task:
+            continue
+
+        if r_point and r_point != point:
+            continue
+
+        # day match: exact ISO or day-of-month
+        if r_day and (r_day != day_iso and r_day != day_num):
+            continue
+
+        out.append(detect_and_fix_text(r_task))
+
+    # If the sheet is a matrix by day-of-month on X and tasks on Y, you likely exported a different structure.
+    # In that case use the previous version of bot or give a proper CSV export.
+    return out
+
+
+def split_tasks_two_zones(tasks: List[str]) -> Tuple[List[str], List[str]]:
+    # alternating split gives more even workload
+    a, b = [], []
+    for i, t in enumerate(tasks):
+        (a if i % 2 == 0 else b).append(t)
+    return a, b
+
+
+# ----------------- CLEANING STATE -----------------
+
+def get_or_init_day_point_cleaning(day: str, point: str) -> dict:
+    cleaning = load_cleaning()
+    k = day_point_key(day, point)
+    if k not in cleaning:
+        cleaning[k] = {
+            "day": day,
+            "point": point,
+            "tasks": [],            # full task list for the day+point
+            "split": {},            # task_index -> "A"/"B"
+            "done": {},             # task_index -> {by, ts, photo_file_id}
+        }
+        save_cleaning(cleaning)
+    return cleaning[k]
+
+
+def ensure_tasks_loaded(day: str, point: str) -> List[str]:
+    cleaning = load_cleaning()
+    k = day_point_key(day, point)
+    state = cleaning.get(k)
+    if not state:
+        state = get_or_init_day_point_cleaning(day, point)
+        cleaning = load_cleaning()
+
+    if state.get("tasks"):
+        return state["tasks"]
 
     if not SCHEDULE_CSV_URL:
-        raise RuntimeError("SCHEDULE_CSV_URL is not set")
+        # fallback demo tasks
+        tasks = [
+            "Шкафы: прибраться внутри",
+            "Кофемашину сверху протереть",
+            "Проверка на ротацию продукции",
+            "Дверцы шкафчиков и стойка со стороны гостей",
+        ]
+    else:
+        txt = fetch_schedule_csv()
+        tasks = parse_schedule_tasks_for_today(txt, point, datetime.fromisoformat(day).date())
 
-    r = requests.get(SCHEDULE_CSV_URL, timeout=25)
-    r.raise_for_status()
+    # store tasks + split map
+    a, b = split_tasks_two_zones(tasks)
+    split = {}
+    for idx, _ in enumerate(tasks):
+        split[str(idx)] = "A" if idx % 2 == 0 else "B"
 
-    # Force UTF-8 decoding for Cyrillic
-    r.encoding = 'utf-8'
-
-    csv_text = r.content.decode('utf-8-sig', errors='replace')
-    reader = csv.DictReader(StringIO(csv_text))
-    rows = list(reader)
-    if not rows:
-        raise RuntimeError("Schedule CSV is empty")
-
-    norm_rows: list[dict] = []
-    for row in rows:
-        norm = {}
-        for k, v in row.items():
-            kk = k.strip() if isinstance(k, str) else k
-            vv = v.strip() if isinstance(v, str) else v
-            norm[kk] = vv
-        norm_rows.append(norm)
-
-    # Required minimal columns
-    for col in ["task_id", "task_name", "point"]:
-        if col not in norm_rows[0]:
-            raise RuntimeError(f"Missing column in schedule: {col}")
-
-    SCHEDULE_CACHE.rows = norm_rows
-    SCHEDULE_CACHE.fetched_at = time.time()
-    return norm_rows
-
-
-def get_today_tasks(point: str) -> list[dict]:
-    rows = fetch_schedule_rows()
-    day = now_dt().day
-    day_col = f"D{day}"
-
-    def is_active(v) -> bool:
-        if v is None:
-            return False
-        s = str(v).strip().lower()
-        if s in ("1", "true", "yes", "y", "да"):
-            return True
-        return False
-
-    tasks: list[dict] = []
-    for row in rows:
-        row_point = str(row.get("point", "")).strip()
-        if row_point not in (point, "ALL"):
-            continue
-
-        if day_col not in row:
-            continue
-        if not is_active(row.get(day_col)):
-            continue
-
-        task_id = str(row.get("task_id", "")).strip() or "NA"
-        name = str(row.get("task_name", "")).strip()
-        if not name or name.lower() == "nan":
-            name = f"(без названия) {task_id}"
-
-        tasks.append({"task_id": task_id, "task_name": name})
-
+    state = {
+        "day": day,
+        "point": point,
+        "tasks": tasks,
+        "split": split,
+        "done": state.get("done", {}),
+    }
+    cleaning[k] = state
+    save_cleaning(cleaning)
     return tasks
 
 
-
-def _point_hours(point: str) -> tuple[dtime, dtime]:
-    hhmm_open, hhmm_close = WORK_HOURS.get(point, ("10:00", "22:00"))
-    return parse_hhmm(hhmm_open), parse_hhmm(hhmm_close)
-
-
-def _ts_today_at(t: dtime) -> int:
-    dt = datetime.combine(now_dt().date(), t, TZ)
-    return int(dt.timestamp())
-
-
-def slot_create_custom(tg_id: int, point: str, start_ts: int, planned_end_ts: int) -> int:
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO slots (tg_id, point, start_ts, planned_end_ts, status) "
-            "VALUES (?, ?, ?, ?, 'open')",
-            (tg_id, point, int(start_ts), int(planned_end_ts)),
-        )
-        slot_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-        return slot_id
+def tasks_for_group(day: str, point: str, group: str) -> List[Tuple[int, str]]:
+    tasks = ensure_tasks_loaded(day, point)
+    cleaning = load_cleaning()
+    state = cleaning[day_point_key(day, point)]
+    out = []
+    for idx, t in enumerate(tasks):
+        g = state["split"].get(str(idx), "A")
+        if group == "ALL" or g == group:
+            out.append((idx, t))
+    return out
 
 
-# -------------------- DB helpers --------------------
-def user_get(tg_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,))
-        row = cur.fetchone()
-        conn.close()
-        return row
+def remaining_task_indices(day: str, point: str, group: str) -> List[int]:
+    cleaning = load_cleaning()
+    state = cleaning.get(day_point_key(day, point))
+    if not state or not state.get("tasks"):
+        ensure_tasks_loaded(day, point)
+        cleaning = load_cleaning()
+        state = cleaning[day_point_key(day, point)]
+
+    done = state.get("done", {})
+    remaining = []
+    for idx, _ in tasks_for_group(day, point, group):
+        if str(idx) not in done:
+            remaining.append(idx)
+    return remaining
 
 
-def user_set_pending(tg_id: int, full_name: str):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO users (tg_id, full_name, status, created_at) "
-            "VALUES (?, ?, 'pending', ?) "
-            "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, status='pending'",
-            (tg_id, full_name, now_ts()),
-        )
-        conn.commit()
-        conn.close()
+def mark_task_done(day: str, point: str, idx: int, by_user_id: int, by_name: str, photo_file_id: str):
+    cleaning = load_cleaning()
+    k = day_point_key(day, point)
+    state = cleaning.get(k)
+    if not state:
+        ensure_tasks_loaded(day, point)
+        cleaning = load_cleaning()
+        state = cleaning[k]
+
+    state.setdefault("done", {})
+    state["done"][str(idx)] = {
+        "by": by_user_id,
+        "by_name": by_name,
+        "ts": now_tz().isoformat(),
+        "photo": photo_file_id,
+    }
+    cleaning[k] = state
+    save_cleaning(cleaning)
 
 
-def user_approve(tg_id: int, approved_by: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET status='active', approved_by=? WHERE tg_id=?", (approved_by, tg_id))
-        conn.commit()
-        conn.close()
+# ----------------- SLOT / RESPONSIBILITY -----------------
+
+def new_slot_id() -> str:
+    return f"s{int(now_tz().timestamp())}{os.getpid()}"
 
 
-def user_block(tg_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET status='blocked' WHERE tg_id=?", (tg_id,))
-        conn.commit()
-        conn.close()
+def get_user(users: Dict[str, dict], user_id: int) -> Optional[dict]:
+    return users.get(str(user_id))
 
 
-def user_unblock(tg_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET status='active' WHERE tg_id=?", (tg_id,))
-        conn.commit()
-        conn.close()
+def user_name(users: Dict[str, dict], user_id: int) -> str:
+    u = get_user(users, user_id)
+    return (u or {}).get("name") or f"user{user_id}"
 
 
-def user_set_last_point(tg_id: int, point: str):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET last_point=? WHERE tg_id=?", (point, tg_id))
-        conn.commit()
-        conn.close()
+def open_slot_for_user(user_id: int) -> Optional[dict]:
+    slots = load_slots()
+    for s in slots.values():
+        if s.get("user_id") == user_id and s.get("status") == "open":
+            return s
+    return None
 
 
-def user_set_pending_task(tg_id: int, slot_task_row_id: int | None):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET pending_task_id=? WHERE tg_id=?", (slot_task_row_id, tg_id))
-        conn.commit()
-        conn.close()
+def active_slot_for_point(day: str, point: str) -> List[dict]:
+    slots = load_slots()
+    out = []
+    for s in slots.values():
+        if s.get("day") == day and s.get("point") == point:
+            out.append(s)
+    out.sort(key=lambda x: x.get("opened_at", ""))
+    return out
 
 
-def slot_get_open(tg_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM slots WHERE tg_id=? AND status='open' ORDER BY id DESC LIMIT 1", (tg_id,))
-        row = cur.fetchone()
-        conn.close()
-        return row
+def decide_group_for_slot(day: str, point: str, full_shift: bool) -> str:
+    if full_shift:
+        return "ALL"
+    slots = active_slot_for_point(day, point)
+    # Count already created slots today for this point (any status)
+    # First slot gets A, second gets B, others default to B.
+    count = len(slots)
+    if count <= 0:
+        return "A"
+    if count == 1:
+        return "B"
+    return "B"
 
 
-def slot_create(tg_id: int, point: str, duration_minutes: int) -> int:
-    start = now_ts()
-    planned_end = start + duration_minutes * 60
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO slots (tg_id, point, start_ts, planned_end_ts, status) "
-            "VALUES (?, ?, ?, ?, 'open')",
-            (tg_id, point, start, planned_end),
-        )
-        slot_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-        return slot_id
+def slot_is_full_shift(point: str, start: time, end: time) -> bool:
+    # If duration >= 85% of full shift -> treat as full shift
+    dur = slot_duration_minutes(start, end)
+    full = shift_duration_minutes(point)
+    return dur >= int(full * 0.85)
 
 
-def slot_close(slot_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE slots SET status='closed', closed_ts=? WHERE id=?", (now_ts(), slot_id))
-        conn.commit()
-        conn.close()
+# ----------------- ACCESS CONTROL -----------------
+
+def is_active(user: dict) -> bool:
+    return bool(user and user.get("active", True))
 
 
-def slot_set_reminder_ts(slot_id: int, field: str, ts: int):
-    if field not in ("last_reminder_ts", "last_koasyk_ts"):
-        return
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(f"UPDATE slots SET {field}=? WHERE id=?", (ts, slot_id))
-        conn.commit()
-        conn.close()
+def is_confirmed(user: dict) -> bool:
+    return bool(user and user.get("confirmed", False))
 
 
-def slot_set_handoff(slot_id: int, note: str):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE slots SET handoff_note=? WHERE id=?", (note, slot_id))
-        conn.commit()
-        conn.close()
+def is_limited(user: dict) -> bool:
+    # limited users allowed only: choose point, view plan, mark tasks, upload photos
+    return bool(user and user.get("limited", False))
 
 
-def slot_tasks_seed(slot_id: int, point: str):
-    tasks = get_today_tasks(point)
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        for t in tasks:
-            cur.execute(
-                "INSERT INTO slot_tasks (slot_id, task_id, task_name, status) "
-                "VALUES (?, ?, ?, 'pending')",
-                (slot_id, t["task_id"], t["task_name"]),
-            )
-        conn.commit()
-        conn.close()
+def require_user(update: Update) -> dict:
+    users = load_users()
+    u = users.get(str(update.effective_user.id))
+    if not u:
+        return {}
+    return u
 
 
-def slot_tasks_list(slot_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM slot_tasks WHERE slot_id=? ORDER BY id ASC", (slot_id,))
-        rows = cur.fetchall()
-        conn.close()
-        return rows
+def can_use_feature(user: dict, feature: str) -> bool:
+    """
+    feature:
+      - "choose_point"
+      - "plan"
+      - "mark"
+      - "transfer"
+      - "incident"
+      - "report"
+      - "admin"
+    """
+    if not user:
+        return False
+    if is_admin(user.get("id", 0)):
+        return True
+    if not is_active(user):
+        return False
+
+    if is_limited(user):
+        return feature in {"choose_point", "plan", "mark"}
+
+    # normal active user
+    return True
 
 
-def slot_task_mark_wait_photo(slot_task_row_id: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE slot_tasks SET status='wait_photo' WHERE id=?", (slot_task_row_id,))
-        conn.commit()
-        conn.close()
+# ----------------- CONVERSATIONS -----------------
+
+REG_NAME, REG_CODE = range(2)
+
+SLOT_POINT, SLOT_MODE, SLOT_TIME = range(3)
+
+MARK_PICK_TASK, MARK_WAIT_PHOTO = range(2)
+
+TRANSFER_WAIT_COMMENT = 1
+
+REPORT_POINT, REPORT_CASH, REPORT_CASHLESS, REPORT_PHOTO = range(4)
 
 
-def slot_task_attach_photo_done(slot_task_row_id: int, photo_file_id: str):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE slot_tasks SET status='done', done_ts=?, photo_file_id=? WHERE id=?",
-            (now_ts(), photo_file_id, slot_task_row_id),
-        )
-        conn.commit()
-        conn.close()
+# ----------------- UI -----------------
+
+def main_menu_kb(user: dict) -> InlineKeyboardMarkup:
+    btns = []
+    btns.append([InlineKeyboardButton("🏷 Выбрать точку", callback_data="choose_point")])
+    btns.append([InlineKeyboardButton("🧹 План уборки сегодня", callback_data="plan_today")])
+    btns.append([InlineKeyboardButton("✅ Отметить выполненное (с фото)", callback_data="mark_tasks")])
+
+    # Limited users stop here
+    if not is_limited(user):
+        btns.append([InlineKeyboardButton("🔁 Передать точку (закрыть слот)", callback_data="transfer_point")])
+        btns.append([InlineKeyboardButton("🧾 Фин. отчёт (закрытие дня)", callback_data="fin_report")])
+        btns.append([InlineKeyboardButton("💬 Инцидент / Комментарий", callback_data="incident")])
+
+    if is_admin(user.get("id", 0)):
+        btns.append([InlineKeyboardButton("🛠 Админка", callback_data="admin")])
+
+    return InlineKeyboardMarkup(btns)
 
 
-def shift_totals_upsert(
-    slot_id: int,
-    deposit: float,
-    cash: float,
-    card: float,
-    photo1: str,
-    photo2: str | None,
-    comment: str,
-):
-    total = cash + card
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO shift_totals (slot_id, deposit, cash, card, total, receipt_photo1, receipt_photo2, comment) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(slot_id) DO UPDATE SET "
-            " deposit=excluded.deposit, cash=excluded.cash, card=excluded.card, total=excluded.total, "
-            " receipt_photo1=excluded.receipt_photo1, receipt_photo2=excluded.receipt_photo2, comment=excluded.comment",
-            (slot_id, deposit, cash, card, total, photo1, photo2, comment),
-        )
-        conn.commit()
-        conn.close()
-
-
-def incident_add(tg_id: int, slot_id: int | None, point: str | None, text: str, photo_file_id: str | None):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO incidents (tg_id, slot_id, point, ts, text, photo_file_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (tg_id, slot_id, point, now_ts(), text, photo_file_id),
-        )
-        conn.commit()
-        conn.close()
-
-
-def koasyk_add(slot_id: int, reason: str):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO koasyk_events (slot_id, ts, reason) VALUES (?, ?, ?)", (slot_id, now_ts(), reason))
-        conn.commit()
-        conn.close()
-
-
-# -------------------- UI --------------------
-def employee_menu():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📍 Выбрать точку"), KeyboardButton("📋 План сегодня")],
-            [KeyboardButton("▶️ Начать слот"), KeyboardButton("✅ Отметить выполненное")],
-            [KeyboardButton("🔁 Передать точку"), KeyboardButton("⚠️ Инцидент/Комментарий")],
-            [KeyboardButton("🧾 Фин. отчёт (закрыть слот)")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def admin_menu():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📊 Сводка сегодня"), KeyboardButton("🚨 Косяки/просрочки")],
-            [KeyboardButton("👥 Сотрудники"), KeyboardButton("🧾 Отчёт недели")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def points_kb(prefix: str):
+def points_kb(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(p, callback_data=f"{prefix}:{p}")] for p in POINTS])
 
 
-# -------------------- Conversation states --------------------
-CLOSE_DEP, CLOSE_CASH, CLOSE_CARD, CLOSE_PHOTO1, CLOSE_PHOTO2, CLOSE_COMMENT = range(6)
-HANDOFF_COMMENT = 10
-SLOT_TIME_START = 20
-SLOT_TIME_END = 21
+# ----------------- START / REGISTER -----------------
 
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid = update.effective_user.id
+    u = users.get(str(uid))
 
-# -------------------- Commands --------------------
-async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"chat_id = {update.effective_chat.id}")
-
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Нет прав.")
-        return
-    await update.message.reply_text("Админ-меню:", reply_markup=admin_menu())
-
-
-async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /block <tg_id>")
-        return
-    user_block(int(context.args[0]))
-    await update.message.reply_text("Ок.")
-
-
-async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /unblock <tg_id>")
-        return
-    user_unblock(int(context.args[0]))
-    await update.message.reply_text("Ок.")
-
-
-# -------------------- Core flow --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    row = user_get(u.id)
-
-    if row and row["status"] == "active":
-        await update.message.reply_text("Ты активен. Выбирай действие.", reply_markup=employee_menu())
-        if is_admin(u.id):
-            await update.message.reply_text("Админ-меню: /admin", reply_markup=admin_menu())
-        return
-
-    await update.message.reply_text("Привет. Введи своё имя (как в отчётах), одним сообщением.\nПример: Иван Петров")
-    context.user_data.clear()
-    context.user_data["reg_step"] = "name"
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    text = (update.message.text or "").strip()
-
-    # Admin shortcuts via buttons
-    if is_admin(u.id):
-        if text == "📊 Сводка сегодня":
-            await send_today_summary(context, to_chat=update.effective_chat.id)
-            return
-        if text == "🚨 Косяки/просрочки":
-            await send_koasyk_today(context, to_chat=update.effective_chat.id)
-            return
-        if text == "👥 Сотрудники":
-            await send_users_list(context, to_chat=update.effective_chat.id)
-            return
-        if text == "🧾 Отчёт недели":
-            await send_week_report(context, to_chat=update.effective_chat.id)
-            return
-
-    # Registration steps
-    if context.user_data.get("reg_step") == "name":
-        context.user_data["reg_name"] = text
-        context.user_data["reg_step"] = "code"
-        await update.message.reply_text("Ок. Теперь введи код доступа.")
-        return
-
-    if context.user_data.get("reg_step") == "code":
-        if text.strip() != ACCESS_CODE.strip():
-            await update.message.reply_text("Код неверный. Попробуй ещё раз.")
-            return
-
-        full_name = context.user_data.get("reg_name", "Без имени")
-        user_set_pending(u.id, full_name)
-
-        # Send approval request to control (NO Markdown -> safe)
-        if CONTROL_CHAT_ID != 0:
-            try:
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Одобрить", callback_data=f"appr:{u.id}"),
-                    InlineKeyboardButton("⛔ Отклонить", callback_data=f"rej:{u.id}"),
-                ]])
-                await context.bot.send_message(
-                    CONTROL_CHAT_ID,
-                    f"Новая заявка сотрудника:\n• {full_name}\n• tg_id: {u.id}",
-                    reply_markup=kb,
-                )
-            except Exception as e:
-                logger.exception("Failed to send approval request: %s", e)
-                await update.message.reply_text(
-                    "✅ Код принят, но заявку в «Контроль» отправить не смог.\n"
-                    "Проверь, что бот добавлен в группу и может писать."
-                )
-                context.user_data.clear()
-                return
-
-        await update.message.reply_text("Заявка отправлена. Жди подтверждения.")
-        context.user_data.clear()
-        return
-
-    # Gate: only active employees can proceed
-    row = user_get(u.id)
-    if not row or row["status"] != "active":
-        await update.message.reply_text("Нет доступа. Напиши /start и пройди регистрацию.")
-        return
-
-    # Incident free text flow
-    if context.user_data.get("incident_mode"):
-        context.user_data["incident_text"] = text
-        context.user_data["incident_mode"] = False
-        context.user_data["incident_wait_photo"] = True
-        await update.message.reply_text("Если нужно — пришли фото. Если фото не нужно — напиши: без фото")
-        return
-
-    if context.user_data.get("incident_wait_photo") and text.lower().strip() == "без фото":
-        open_slot = slot_get_open(u.id)
-        point = open_slot["point"] if open_slot else row["last_point"]
-        inc_text = context.user_data.get("incident_text", "(без текста)")
-
-        incident_add(u.id, open_slot["id"] if open_slot else None, point, inc_text, None)
-
-        context.user_data.pop("incident_wait_photo", None)
-        context.user_data.pop("incident_text", None)
-
-        # Notify control
-        if CONTROL_CHAT_ID != 0:
-            try:
-                await context.bot.send_message(
-                    CONTROL_CHAT_ID,
-                    f"⚠️ Инцидент\nТочка: {point}\nСотрудник: {row['full_name']}\nТекст: {inc_text}",
-                )
-            except Exception:
-                pass
-
-        await update.message.reply_text("Инцидент записан.", reply_markup=employee_menu())
-        return
-
-    # Employee menu actions
-    if text == "📍 Выбрать точку":
-        await update.message.reply_text("Выбери точку:", reply_markup=points_kb("setpoint"))
-        return
-
-    if text == "📋 План сегодня":
-        last_point = row["last_point"]
-        if not last_point:
-            await update.message.reply_text("Сначала выбери точку: 📍 Выбрать точку")
-            return
-        try:
-            tasks = get_today_tasks(last_point)
-        except Exception as e:
-            await update.message.reply_text(f"Не могу прочитать график уборки. Проверь таблицу/ссылку.\nОшибка: {e}")
-            return
-        if not tasks:
-            await update.message.reply_text("На сегодня задач не найдено (проверь таблицу).")
-            return
+    if u and is_active(u):
         await update.message.reply_text(
-            f"План на сегодня ({last_point}):\n" + "\n".join([f"• {t['task_name']}" for t in tasks[:100]]),
-            reply_markup=employee_menu(),
+            "Меню:",
+            reply_markup=main_menu_kb(u)
         )
+        return ConversationHandler.END
+
+    await update.message.reply_text("Привет! Напиши своё имя (как тебя записать).", reply_markup=ReplyKeyboardRemove())
+    return REG_NAME
+
+
+async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = (update.message.text or "").strip()
+    if len(name) < 2:
+        await update.message.reply_text("Напиши имя нормально (минимум 2 буквы).")
+        return REG_NAME
+
+    context.user_data["reg_name"] = name
+    await update.message.reply_text("Теперь введи код доступа.")
+    return REG_CODE
+
+
+async def reg_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    name = context.user_data.get("reg_name", update.effective_user.first_name)
+
+    if code != ACCESS_CODE:
+        await update.message.reply_text("Код неверный. Попробуй ещё раз.")
+        return REG_CODE
+
+    users = load_users()
+    dt = now_tz()
+
+    # Auto-approve limited users in window
+    auto = in_auto_approve_window(dt)
+    users[str(uid)] = {
+        "id": uid,
+        "name": name,
+        "active": True,
+        "confirmed": True,    # you asked auto-activation with locks; confirmed=True but limited=True still
+        "limited": True,      # locks: only choose/plan/mark
+        "registered_at": dt.isoformat(),
+        "auto_approved": auto,
+    }
+    save_users(users)
+
+    # notify control group
+    if CONTROL_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=CONTROL_CHAT_ID,
+                text=f"✅ Новый сотрудник активирован: {name} ({uid}) [ограниченный доступ]"
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        "✅ Ок! Ты добавлен.\n"
+        "Сейчас доступно: выбрать точку, смотреть план уборки и отмечать задачи с фото.\n\n"
+        "Открой меню:",
+        reply_markup=main_menu_kb(users[str(uid)])
+    )
+    return ConversationHandler.END
+
+
+# ----------------- POINT SELECTION -----------------
+
+async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = require_user(update)
+    if not can_use_feature(user, "choose_point"):
+        await q.edit_message_text("Нет доступа.")
         return
 
-    if text == "▶️ Начать слот":
-        open_slot = slot_get_open(u.id)
-        if open_slot:
-            await update.message.reply_text("У тебя уже есть открытый слот. Работай по нему или закрой.", reply_markup=employee_menu())
-            return
-        await update.message.reply_text("Выбери точку для слота:", reply_markup=points_kb("point"))
+    await q.edit_message_text("Выбери точку:", reply_markup=points_kb("set_point"))
+
+
+async def set_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    point = q.data.split(":", 1)[1]
+    users = load_users()
+    uid = update.effective_user.id
+    u = users.get(str(uid))
+    if not u:
+        await q.edit_message_text("Нужно /start и регистрация.")
         return
 
-    if text == "✅ Отметить выполненное":
-        open_slot = slot_get_open(u.id)
-        if not open_slot:
-            await update.message.reply_text("Нет активного слота. Нажми ▶️ Начать слот.")
-            return
-        if row["pending_task_id"]:
-            await update.message.reply_text("Сначала отправь фото по предыдущей задаче.")
-            return
+    u["point"] = point
+    users[str(uid)] = u
+    save_users(users)
 
-        rows = slot_tasks_list(open_slot["id"])
-        if not rows:
-            await update.message.reply_text("На этот слот задач нет (проверь расписание на сегодня).")
-            return
+    await q.edit_message_text(f"✅ Точка установлена: <b>{html_escape(point)}</b>\n\nМеню:", parse_mode=ParseMode.HTML)
+    await q.message.reply_text("Меню:", reply_markup=main_menu_kb(u))
 
-        buttons = []
-        for r in rows:
-            if r["status"] == "pending":
-                buttons.append([InlineKeyboardButton(r["task_name"], callback_data=f"done:{r['id']}")])
 
-        if not buttons:
-            await update.message.reply_text("Пока нет задач для отметки (всё закрыто или ждёт фото).", reply_markup=employee_menu())
-            return
+# ----------------- PLAN TODAY -----------------
 
-        await update.message.reply_text("Выбери задачу, которую выполнил:", reply_markup=InlineKeyboardMarkup(buttons[:60]))
+def get_user_group_for_today(uid: int, day: str, point: str) -> str:
+    # If user has an open slot today on that point, use its group. Otherwise default:
+    slots = load_slots()
+    for s in slots.values():
+        if s.get("day") == day and s.get("point") == point and s.get("user_id") == uid:
+            if s.get("status") == "open":
+                return s.get("group", "A")
+    # If no slot, we still show something: default A
+    return "A"
+
+
+async def plan_today_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = require_user(update)
+    if not can_use_feature(user, "plan"):
+        await q.edit_message_text("Нет доступа.")
         return
 
-    if text == "⚠️ Инцидент/Комментарий":
-        context.user_data["incident_mode"] = True
-        await update.message.reply_text("Напиши текст инцидента/комментария одним сообщением. Потом можно фото.")
+    point = user.get("point")
+    if not point:
+        await q.edit_message_text("Сначала выбери точку.", reply_markup=points_kb("set_point"))
         return
 
-    if text == "🔁 Передать точку":
-        open_slot = slot_get_open(u.id)
-        if not open_slot:
-            await update.message.reply_text("Нет активного слота. Сначала ▶️ Начать слот.")
-            return
-        context.user_data["close_slot_id"] = open_slot["id"]
-        await update.message.reply_text("Передача точки: напиши коротко, что не сделано/на что обратить внимание:")
-        return HANDOFF_COMMENT
+    day = today_key()
+    group = get_user_group_for_today(update.effective_user.id, day, point)
+    tasks = tasks_for_group(day, point, group)
+    cleaning = load_cleaning()[day_point_key(day, point)]
+    done = cleaning.get("done", {})
 
-    if text == "🧾 Фин. отчёт (закрыть слот)":
-        open_slot = slot_get_open(u.id)
-        if not open_slot:
-            await update.message.reply_text("Нет активного слота.")
-            return
-        context.user_data["close_slot_id"] = open_slot["id"]
-        context.user_data["handoff_note"] = None
-        await update.message.reply_text("Введи ВНЕСЕНИЕ (число, можно 0):")
-        return CLOSE_DEP
+    lines = [f"<b>План на сегодня ({html_escape(point)})</b>", f"Зона ответственности: <b>{group}</b>"]
+    for idx, t in tasks:
+        mark = "✅" if str(idx) in done else "⬜️"
+        lines.append(f"{mark} {html_escape(t)}")
 
-    await update.message.reply_text("Ок. Выбирай действие.", reply_markup=employee_menu())
+    rem = remaining_task_indices(day, point, group)
+    lines.append("")
+    lines.append(f"Осталось: <b>{len(rem)}</b>")
+
+    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(user))
 
 
-# -------------------- Callback queries --------------------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----------------- MARK TASKS -----------------
+
+async def mark_tasks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = require_user(update)
+    if not can_use_feature(user, "mark"):
+        await q.edit_message_text("Нет доступа.")
+        return
+
+    point = user.get("point")
+    if not point:
+        await q.edit_message_text("Сначала выбери точку.", reply_markup=points_kb("set_point"))
+        return
+
+    day = today_key()
+    group = get_user_group_for_today(update.effective_user.id, day, point)
+
+    rem = remaining_task_indices(day, point, group)
+    if not rem:
+        await q.edit_message_text("✅ Всё по твоей зоне закрыто. Отлично.", reply_markup=main_menu_kb(user))
+        # clear violation once resolved
+        clear_violation_for_user_slot(update.effective_user.id, "cleaning_pending")
+        return ConversationHandler.END
+
+    # build buttons for remaining tasks
+    cleaning = load_cleaning()[day_point_key(day, point)]
+    tasks = cleaning["tasks"]
+    buttons = []
+    for idx in rem[:30]:
+        title = tasks[idx]
+        buttons.append([InlineKeyboardButton(title[:50], callback_data=f"do_task:{idx}")])
+
+    await q.edit_message_text(
+        f"Выбери задачу, которую сделал (потом попросит фото). Зона: {group}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    context.user_data["mark_point"] = point
+    context.user_data["mark_day"] = day
+    context.user_data["mark_group"] = group
+    return MARK_PICK_TASK
+
+
+async def pick_task_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-    u = update.effective_user
+    idx = int(data.split(":", 1)[1])
+    context.user_data["mark_idx"] = idx
+    await q.edit_message_text("Теперь пришли 1 фото (после выполнения задачи).")
+    return MARK_WAIT_PHOTO
+
+
+async def mark_wait_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg: Message = update.message
+    if not msg.photo:
+        await msg.reply_text("Нужно именно фото. Пришли фото ещё раз.")
+        return MARK_WAIT_PHOTO
+
+    file_id = msg.photo[-1].file_id  # best quality
+    uid = update.effective_user.id
+    users = load_users()
+    name = user_name(users, uid)
+
+    day = context.user_data.get("mark_day", today_key())
+    point = context.user_data.get("mark_point")
+    group = context.user_data.get("mark_group", "A")
+    idx = int(context.user_data.get("mark_idx"))
 
-    # Admin approval
-    if data.startswith("appr:") or data.startswith("rej:"):
-        if not is_admin(u.id):
-            await q.edit_message_text("Нет прав.")
-            return
-        tg_id = int(data.split(":")[1])
-
-        if data.startswith("appr:"):
-            user_approve(tg_id, u.id)
-            await q.edit_message_text(f"✅ Одобрен tg_id={tg_id}")
-            try:
-                await context.bot.send_message(tg_id, "Ты активирован. Можно работать.", reply_markup=employee_menu())
-            except Exception:
-                pass
-        else:
-            user_block(tg_id)
-            await q.edit_message_text(f"⛔ Отклонён tg_id={tg_id}")
-        return
-
-    # Set point (for plan, etc.)
-    if data.startswith("setpoint:"):
-        point = data.split(":", 1)[1]
-        if point not in POINTS:
-            await q.edit_message_text("Неверная точка.")
-            return
-        user_set_last_point(u.id, point)
-        await q.edit_message_text(f"Точка выбрана: {point}\nТеперь можно открыть 📋 План сегодня.")
-        return
-
-    # Start slot flow
-    if data.startswith("point:"):
-        point = data.split(":", 1)[1]
-        if point not in POINTS:
-            await q.edit_message_text("Неверная точка.")
-            return
-        user_set_last_point(u.id, point)
-        open_t, close_t = _point_hours(point)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🕘 Смена (до закрытия)", callback_data=f"full:{point}")],
-            [InlineKeyboardButton("⏱ Ввести время (с/до)", callback_data=f"custom:{point}")],
-        ])
-        await q.edit_message_text(
-            f"Точка: {point}\nЧасы: {open_t.strftime('%H:%M')}–{close_t.strftime('%H:%M')}\n\nВыбери вариант слота:",
-            reply_markup=kb,
-        )
-        return
-    if data.startswith("full:"):
-        point = data.split(":", 1)[1]
-        if point not in POINTS:
-            await q.edit_message_text("Неверная точка.")
-            return
-        if slot_get_open(u.id):
-            await q.edit_message_text("У тебя уже есть открытый слот.")
-            return
-
-        open_t, close_t = _point_hours(point)
-        close_ts = _ts_today_at(close_t)
-        now = now_ts()
-
-        if now >= close_ts:
-            await q.edit_message_text("Смена уже закончилась для этой точки. Если нужно — выбери время (с/до).")
-            return
-
-        slot_id = slot_create_custom(u.id, point, now, close_ts)
-        try:
-            slot_tasks_seed(slot_id, point)
-        except Exception as e:
-            await q.edit_message_text(f"Слот создан, но график уборки прочитать не смог. Ошибка: {e}")
-            return
-
-        await q.edit_message_text(
-            f"Слот начат (до закрытия).\nТочка: {point}\nДо: {close_t.strftime('%H:%M')}\n\nДальше: ✅ Отметить выполненное"
-        )
-        try:
-            await context.bot.send_message(u.id, "Меню:", reply_markup=employee_menu())
-        except Exception:
-            pass
-        return
-
-    if data.startswith("custom:"):
-        point = data.split(":", 1)[1]
-        if point not in POINTS:
-            await q.edit_message_text("Неверная точка.")
-            return
-        if slot_get_open(u.id):
-            await q.edit_message_text("У тебя уже есть открытый слот.")
-            return
-
-        context.user_data["slot_point"] = point
-        open_t, close_t = _point_hours(point)
-
-        await q.edit_message_text(
-            f"Введи время НАЧАЛА слота (HH:MM)\nТочка: {point}\nЧасы: {open_t.strftime('%H:%M')}–{close_t.strftime('%H:%M')}"
-        )
-        return SLOT_TIME_START
-
-    # Mark a task -> wait photo
-    if data.startswith("done:"):
-        row = user_get(u.id)
-        if not row or row["status"] != "active":
-            await q.edit_message_text("Нет доступа.")
-            return
-        if row["pending_task_id"]:
-            await q.edit_message_text("Сначала отправь фото по предыдущей задаче.")
-            return
-
-        slot_task_row_id = int(data.split(":")[1])
-        slot_task_mark_wait_photo(slot_task_row_id)
-        user_set_pending_task(u.id, slot_task_row_id)
-        await q.edit_message_text("📷 Прикрепи фото по задаче одним сообщением.")
-        return
-
-
-# -------------------- Photos --------------------
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    row = user_get(u.id)
-    if not row:
-        await update.message.reply_text("Сначала /start")
-        return
-
-    file_id = update.message.photo[-1].file_id
-
-    # Incident photo
-    if context.user_data.get("incident_wait_photo"):
-        open_slot = slot_get_open(u.id)
-        point = open_slot["point"] if open_slot else row["last_point"]
-        inc_text = context.user_data.get("incident_text", "(без текста)")
-
-        incident_add(u.id, open_slot["id"] if open_slot else None, point, inc_text, file_id)
-
-        context.user_data.pop("incident_wait_photo", None)
-        context.user_data.pop("incident_text", None)
-
-        if CONTROL_CHAT_ID != 0:
-            try:
-                await context.bot.send_message(
-                    CONTROL_CHAT_ID,
-                    f"⚠️ Инцидент\nТочка: {point}\nСотрудник: {row['full_name']}\n(см. фото)",
-                )
-                await context.bot.send_photo(CONTROL_CHAT_ID, file_id)
-            except Exception:
-                pass
-
-        await update.message.reply_text("Инцидент записан.", reply_markup=employee_menu())
-        return
-
-    # Task photo
-    pending_task = row["pending_task_id"]
-    if pending_task:
-        slot_task_attach_photo_done(pending_task, file_id)
-        user_set_pending_task(u.id, None)
-        await update.message.reply_text("✅ Задача закрыта (фото принято).", reply_markup=employee_menu())
-        return
-
-    # Close flow photos
-    if context.user_data.get("close_wait") == "photo1":
-        context.user_data["photo1"] = file_id
-        context.user_data["close_wait"] = "photo2"
-        await update.message.reply_text("Пришли 2-е фото чеков (если нужно) или напиши: пропустить")
-        return CLOSE_PHOTO2
-
-    if context.user_data.get("close_wait") == "photo2":
-        context.user_data["photo2"] = file_id
-        context.user_data["close_wait"] = "comment"
-        await update.message.reply_text("Напиши комментарий по слоту (можно 'всё ок'):")
-        return CLOSE_COMMENT
-    await update.message.reply_text("Фото получено, но сейчас бот не ждёт фото.", reply_markup=employee_menu())
-
-
-# -------------------- Close / Handoff conversation --------------------
-async def handoff_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    note = (update.message.text or "").strip()
-    slot_id = context.user_data.get("close_slot_id")
-    if slot_id:
-        slot_set_handoff(slot_id, note)
-    context.user_data["handoff_note"] = note
-    await update.message.reply_text("Ок. Теперь фин. отчёт. Введи ВНЕСЕНИЕ (число, можно 0):")
-    return CLOSE_DEP
-
-
-async def close_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["dep"] = float((update.message.text or "0").replace(",", ".").strip())
-    except Exception:
-        await update.message.reply_text("Нужно число. Введи внесение ещё раз:")
-        return CLOSE_DEP
-    await update.message.reply_text("Введи НАЛИЧКУ (число, можно 0):")
-    return CLOSE_CASH
-
-
-async def close_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["cash"] = float((update.message.text or "0").replace(",", ".").strip())
-    except Exception:
-        await update.message.reply_text("Нужно число. Введи наличку ещё раз:")
-        return CLOSE_CASH
-    await update.message.reply_text("Введи БЕЗНАЛ (терминал) (число, можно 0):")
-    return CLOSE_CARD
-
-
-async def close_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["card"] = float((update.message.text or "0").replace(",", ".").strip())
-    except Exception:
-        await update.message.reply_text("Нужно число. Введи безнал ещё раз:")
-        return CLOSE_CARD
-
-    context.user_data["close_wait"] = "photo1"
-    await update.message.reply_text("Пришли 1-е фото чеков (обязательно):")
-    return CLOSE_PHOTO1
-
-
-async def close_photo2_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip().lower()
-    if txt == "пропустить":
-        context.user_data["photo2"] = None
-        context.user_data["close_wait"] = "comment"
-        await update.message.reply_text("Напиши комментарий по слоту (можно 'всё ок'):")
-        return CLOSE_COMMENT
-
-    await update.message.reply_text("Пришли фото или напиши: пропустить")
-    return CLOSE_PHOTO2
-
-
-async def close_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    comment = (update.message.text or "").strip() or "без комментария"
-    slot_id = context.user_data.get("close_slot_id")
-    if not slot_id:
-        await update.message.reply_text("Ошибка: слот не найден.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    dep = float(context.user_data.get("dep", 0.0))
-    cash = float(context.user_data.get("cash", 0.0))
-    card = float(context.user_data.get("card", 0.0))
-    photo1 = context.user_data.get("photo1")
-    photo2 = context.user_data.get("photo2")
-    handoff_note = context.user_data.get("handoff_note")
-
-    if not photo1:
-        await update.message.reply_text("Нужно 1-е фото чеков. Пришли фото:")
-        context.user_data["close_wait"] = "photo1"
-        return CLOSE_PHOTO1
-
-    shift_totals_upsert(slot_id, dep, cash, card, photo1, photo2, comment)
-    slot_close(slot_id)
-
-    # Slot + task stats
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM slots WHERE id=?", (slot_id,))
-        s = cur.fetchone()
-        cur.execute("SELECT status, COUNT(*) c FROM slot_tasks WHERE slot_id=? GROUP BY status", (slot_id,))
-        stats = {r["status"]: r["c"] for r in cur.fetchall()}
-        conn.close()
-
-    pending = int(stats.get("pending", 0))
-    waitp = int(stats.get("wait_photo", 0))
-    done = int(stats.get("done", 0))
-    total_tasks = pending + waitp + done
-
-    user_row = user_get(update.effective_user.id)
-    msg = (
-        "🧾 Слот закрыт\n"
-        f"Точка: {s['point']}\n"
-        f"Сотрудник: {user_row['full_name']}\n"
-        f"Задачи: {done}/{total_tasks} (ожидают фото: {waitp}, не начаты: {pending})\n"
-        f"Внесение: {dep:.0f}\n"
-        f"Наличка: {cash:.0f}\n"
-        f"Терминал: {card:.0f}\n"
-        f"Итого: {(cash+card):.0f}\n"
-        f"Комментарий: {comment}"
-    )
-    if handoff_note:
-        msg += f"\nПередача точки: {handoff_note}"
-
-    await update.message.reply_text("Слот закрыт. Спасибо.", reply_markup=employee_menu())
-
-    if CONTROL_CHAT_ID != 0:
-        try:
-            await context.bot.send_message(CONTROL_CHAT_ID, msg)
-            await context.bot.send_photo(CONTROL_CHAT_ID, photo1)
-            if photo2:
-                await context.bot.send_photo(CONTROL_CHAT_ID, photo2)
-        except Exception:
-            pass
-
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Ок, отменил.", reply_markup=employee_menu())
-    return ConversationHandler.END
-
-
-# -------------------- Jobs (reminders / summary) --------------------
-async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    # Find all open slots
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM slots WHERE status='open'")
-        slots = cur.fetchall()
-        conn.close()
-
-    if not slots:
-        return
-
-    now = now_ts()
-    for s in slots:
-        tg_id = int(s["tg_id"])
-        slot_id = int(s["id"])
-        planned_end = int(s["planned_end_ts"])
-
-        # Task stats
-        with DB_LOCK:
-            conn = db()
-            cur = conn.cursor()
-            cur.execute("SELECT status, COUNT(*) c FROM slot_tasks WHERE slot_id=? GROUP BY status", (slot_id,))
-            stats = {r["status"]: int(r["c"]) for r in cur.fetchall()}
-            conn.close()
-
-        pending = int(stats.get("pending", 0))
-        waitp = int(stats.get("wait_photo", 0))
-
-        # Regular reminder
-        last_rem = int(s["last_reminder_ts"] or 0)
-        if now - last_rem >= REMINDER_INTERVAL_MIN * 60:
-            if pending > 0 or waitp > 0:
-                try:
-                    await context.bot.send_message(
-                        tg_id,
-                        f"⏰ Напоминание: осталось задач: {pending}. Ожидают фото: {waitp}.",
-                    )
-                except Exception:
-                    pass
-            slot_set_reminder_ts(slot_id, "last_reminder_ts", now)
-
-        # Overdue -> "Косяк снял..."
-        if now > planned_end:
-            reasons = []
-            if pending > 0:
-                reasons.append(f"не закрыты задачи ({pending})")
-            if waitp > 0:
-                reasons.append(f"нет фото по задачам ({waitp})")
-            reasons.append("слот не закрыт")
-            reason = ", ".join(reasons)
-
-            last_k = int(s["last_koasyk_ts"] or 0)
-            if now - last_k >= REMINDER_INTERVAL_MIN * 60:
-                try:
-                    await context.bot.send_message(tg_id, f"Косяк снял: {reason}. Доложу руководителю.")
-                except Exception:
-                    pass
-
-                koasyk_add(slot_id, reason)
-
-                if CONTROL_CHAT_ID != 0:
-                    ur = user_get(tg_id)
-                    name = ur["full_name"] if ur else str(tg_id)
-                    try:
-                        await context.bot.send_message(
-                            CONTROL_CHAT_ID,
-                            f"⚠️ Косяк\nТочка: {s['point']}\nСотрудник: {name}\nПричина: {reason}\nПросрочка: {int((now - planned_end)/60)} мин",
-                        )
-                    except Exception:
-                        pass
-
-                slot_set_reminder_ts(slot_id, "last_koasyk_ts", now)
-
-
-async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
-    if CONTROL_CHAT_ID != 0:
-        await send_today_summary(context, to_chat=CONTROL_CHAT_ID)
-
-
-# -------------------- Reports --------------------
-async def send_today_summary(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
-    today = now_dt().date()
-    start = int(datetime.combine(today, dtime(0, 0), TZ).timestamp())
-    end = int(datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ).timestamp())
-
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT s.*, u.full_name "
-            "FROM slots s "
-            "LEFT JOIN users u ON u.tg_id = s.tg_id "
-            "WHERE s.start_ts >= ? AND s.start_ts < ?",
-            (start, end),
-        )
-        slots = cur.fetchall()
-
-        cur.execute(
-            "SELECT s.point, SUM(t.deposit) dep, SUM(t.cash) cash, SUM(t.card) card, SUM(t.total) total "
-            "FROM shift_totals t "
-            "JOIN slots s ON s.id = t.slot_id "
-            "WHERE s.start_ts >= ? AND s.start_ts < ? "
-            "GROUP BY s.point",
-            (start, end),
-        )
-        sums = {r["point"]: r for r in cur.fetchall()}
-        conn.close()
-
-    by_point = {p: [] for p in POINTS}
-    for s in slots:
-        by_point.setdefault(s["point"], []).append(s)
-
-    lines = [f"📊 Сводка дня {today.isoformat()}"]
-    for p in POINTS:
-        lst = by_point.get(p, [])
-        closed = sum(1 for s in lst if s["status"] == "closed")
-        open_ = sum(1 for s in lst if s["status"] == "open")
-
-        sumrow = sums.get(p)
-        if sumrow:
-            total = float(sumrow["total"] or 0)
-            cash = float(sumrow["cash"] or 0)
-            card = float(sumrow["card"] or 0)
-            dep = float(sumrow["dep"] or 0)
-            money = f"Внес: {dep:.0f} | Нал: {cash:.0f} | Тер: {card:.0f} | Итого: {total:.0f}"
-        else:
-            money = "Финансы: нет данных"
-
-        lines.append(f"\n{p}")
-        lines.append(f"Слоты: закрыто {closed}, открыто {open_}")
-        lines.append(money)
-
-    await context.bot.send_message(to_chat, "\n".join(lines))
-
-
-async def send_koasyk_today(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT s.*, u.full_name "
-            "FROM slots s "
-            "LEFT JOIN users u ON u.tg_id = s.tg_id "
-            "WHERE s.status='open'"
-        )
-        slots = cur.fetchall()
-        conn.close()
-
-    if not slots:
-        await context.bot.send_message(to_chat, "🚨 Сейчас нет открытых слотов.")
-        return
-
-    now = now_ts()
-    lines = ["🚨 Открытые слоты / просрочки:"]
-    for s in slots:
-        overdue_min = max(0, int((now - int(s["planned_end_ts"])) / 60))
-        name = s["full_name"] or str(s["tg_id"])
-        tag = f"просрочка {overdue_min} мин" if overdue_min > 0 else "в работе"
-        lines.append(f"• {s['point']} — {name} — {tag}")
-
-    await context.bot.send_message(to_chat, "\n".join(lines))
-
-
-async def send_users_list(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 200")
-        rows = cur.fetchall()
-        conn.close()
-
-    if not rows:
-        await context.bot.send_message(to_chat, "Пользователей нет.")
-        return
-
-    lines = ["👥 Сотрудники:"]
-    for r in rows:
-        lines.append(f"• {r['full_name']} — {r['status']} — tg_id {r['tg_id']}")
-    lines.append("\n/block <tg_id> — заблокировать\n/unblock <tg_id> — разблокировать")
-
-    await context.bot.send_message(to_chat, "\n".join(lines))
-
-
-async def send_week_report(context: ContextTypes.DEFAULT_TYPE, to_chat: int):
-    today = now_dt().date()
-    start_date = today - timedelta(days=7)
-    start = int(datetime.combine(start_date, dtime(0, 0), TZ).timestamp())
-    end = int(datetime.combine(today + timedelta(days=1), dtime(0, 0), TZ).timestamp())
-
-    with DB_LOCK:
-        conn = db()
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT s.tg_id, u.full_name, "
-            " SUM(CASE WHEN st.status='done' THEN 1 ELSE 0 END) AS done_tasks, "
-            " COUNT(*) AS total_tasks, "
-            " SUM(CASE WHEN st.status='wait_photo' THEN 1 ELSE 0 END) AS wait_photo "
-            "FROM slots s "
-            "JOIN slot_tasks st ON st.slot_id = s.id "
-            "LEFT JOIN users u ON u.tg_id = s.tg_id "
-            "WHERE s.start_ts >= ? AND s.start_ts < ? "
-            "GROUP BY s.tg_id",
-            (start, end),
-        )
-        task_rows = {int(r["tg_id"]): r for r in cur.fetchall()}
-
-        cur.execute(
-            "SELECT s.tg_id, u.full_name, "
-            " SUM(COALESCE(t.total,0)) AS revenue, "
-            " SUM((COALESCE(s.closed_ts, s.planned_end_ts) - s.start_ts)) AS seconds "
-            "FROM slots s "
-            "LEFT JOIN shift_totals t ON t.slot_id = s.id "
-            "LEFT JOIN users u ON u.tg_id = s.tg_id "
-            "WHERE s.start_ts >= ? AND s.start_ts < ? "
-            "GROUP BY s.tg_id",
-            (start, end),
-        )
-        rev_rows = cur.fetchall()
-
-        cur.execute(
-            "SELECT s.tg_id, COUNT(*) AS koasyk_cnt "
-            "FROM koasyk_events k "
-            "JOIN slots s ON s.id = k.slot_id "
-            "WHERE s.start_ts >= ? AND s.start_ts < ? "
-            "GROUP BY s.tg_id",
-            (start, end),
-        )
-        ko_rows = {int(r["tg_id"]): int(r["koasyk_cnt"]) for r in cur.fetchall()}
-        conn.close()
-
-    combined = []
-    for r in rev_rows:
-        tg_id = int(r["tg_id"])
-        name = r["full_name"] or str(tg_id)
-        revenue = float(r["revenue"] or 0.0)
-        seconds = float(r["seconds"] or 0.0)
-        hours = seconds / 3600.0 if seconds > 0 else 0.0
-        revph = revenue / hours if hours > 0 else 0.0
-
-        tr = task_rows.get(tg_id)
-        done_tasks = int(tr["done_tasks"]) if tr else 0
-        total_tasks = int(tr["total_tasks"]) if tr else 0
-        disc = (done_tasks / total_tasks * 100.0) if total_tasks > 0 else 0.0
-
-        koasyk_cnt = int(ko_rows.get(tg_id, 0))
-
-        combined.append(
-            {"name": name, "revph": revph, "disc": disc, "done": done_tasks, "total": total_tasks, "koasyk": koasyk_cnt}
-        )
-
-    if not combined:
-        await context.bot.send_message(to_chat, "🧾 Отчёт недели: нет данных.")
-        return
-
-    top_disc = sorted(combined, key=lambda x: (x["disc"], -x["koasyk"]), reverse=True)[:10]
-    top_rev = sorted(combined, key=lambda x: x["revph"], reverse=True)[:10]
-    worst = sorted(combined, key=lambda x: (x["koasyk"], -x["disc"]), reverse=True)[:10]
-
-    lines = [f"🧾 Отчёт недели ({start_date} — {today})", "\nТОП дисциплина"]
-    for x in top_disc:
-        lines.append(f"• {x['name']}: {x['disc']:.0f}% ({x['done']}/{x['total']}), косяков: {x['koasyk']}")
-
-    lines.append("\nТОП выручка/час")
-    for x in top_rev:
-        lines.append(f"• {x['name']}: {x['revph']:.0f} ₽/час")
-
-    lines.append("\nПроблемные (косяки)")
-    for x in worst:
-        lines.append(f"• {x['name']}: косяков {x['koasyk']}, дисциплина {x['disc']:.0f}%")
-
-    await context.bot.send_message(to_chat, "\n".join(lines))
-
-
-
-# -------------------- Custom slot time flow --------------------
-async def slot_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    point = context.user_data.get("slot_point")
     if not point:
-        await update.message.reply_text("Ошибка: точка не выбрана. Нажми ▶️ Начать слот заново.", reply_markup=employee_menu())
-        context.user_data.pop("slot_point", None)
+        await msg.reply_text("Сначала выбери точку.")
         return ConversationHandler.END
 
-    txt = (update.message.text or "").strip()
-    try:
-        t_start = parse_hhmm(txt)
-    except Exception:
-        await update.message.reply_text("Нужно время в формате HH:MM. Пример: 10:00")
-        return SLOT_TIME_START
-
-    open_t, close_t = _point_hours(point)
-    if t_start < open_t or t_start > close_t:
-        await update.message.reply_text(f"Начало должно быть внутри часов точки: {open_t.strftime('%H:%M')}–{close_t.strftime('%H:%M')}")
-        return SLOT_TIME_START
-
-    start_ts = _ts_today_at(t_start)
-    # Не даём старт в далёком будущем
-    if start_ts > now_ts() + 10 * 60:
-        await update.message.reply_text("Начало получилось в будущем. Начни слот ближе к старту и введи время ещё раз.")
-        return SLOT_TIME_START
-
-    context.user_data["slot_start_ts"] = start_ts
-    await update.message.reply_text("Теперь введи время ОКОНЧАНИЯ слота (HH:MM). Пример: 22:00")
-    return SLOT_TIME_END
-
-
-async def slot_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    point = context.user_data.get("slot_point")
-    start_ts = context.user_data.get("slot_start_ts")
-    if not point or not start_ts:
-        await update.message.reply_text("Ошибка: не хватает данных. Нажми ▶️ Начать слот заново.", reply_markup=employee_menu())
-        context.user_data.pop("slot_point", None)
-        context.user_data.pop("slot_start_ts", None)
+    # Enforce responsibility: user can only close tasks from their group (unless admin)
+    cleaning = load_cleaning()[day_point_key(day, point)]
+    task_group = cleaning["split"].get(str(idx), "A")
+    if group != "ALL" and task_group != group and not is_admin(uid):
+        await msg.reply_text("⚠️ Это задача другой зоны. Закрывай только свои задачи.")
         return ConversationHandler.END
 
-    txt = (update.message.text or "").strip()
-    try:
-        t_end = parse_hhmm(txt)
-    except Exception:
-        await update.message.reply_text("Нужно время в формате HH:MM. Пример: 22:00")
-        return SLOT_TIME_END
+    mark_task_done(day, point, idx, uid, name, file_id)
 
-    open_t, close_t = _point_hours(point)
-    if t_end < open_t or t_end > close_t:
-        await update.message.reply_text(f"Окончание должно быть внутри часов точки: {open_t.strftime('%H:%M')}–{close_t.strftime('%H:%M')}")
-        return SLOT_TIME_END
+    # resolve violation flag for this slot if no remaining
+    if not remaining_task_indices(day, point, group):
+        clear_violation_for_user_slot(uid, "cleaning_pending")
 
-    end_ts = _ts_today_at(t_end)
-    if end_ts <= int(start_ts):
-        await update.message.reply_text("Окончание должно быть позже начала. Введи окончание ещё раз:")
-        return SLOT_TIME_END
-
-    if now_ts() >= end_ts:
-        await update.message.reply_text("Окончание уже в прошлом. Проверь время и введи окончание ещё раз:")
-        return SLOT_TIME_END
-
-    # Create slot
-    # Protect against duplicate open slot
-    if slot_get_open(update.effective_user.id):
-        await update.message.reply_text("У тебя уже есть открытый слот.", reply_markup=employee_menu())
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    slot_id = slot_create_custom(update.effective_user.id, point, int(start_ts), int(end_ts))
-    try:
-        slot_tasks_seed(slot_id, point)
-    except Exception as e:
-        await update.message.reply_text(f"Слот создан, но график уборки прочитать не смог. Ошибка: {e}", reply_markup=employee_menu())
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        f"Слот начат.\\nТочка: {point}\\nС: {datetime.fromtimestamp(int(start_ts), TZ).strftime('%H:%M')}\\nДо: {datetime.fromtimestamp(int(end_ts), TZ).strftime('%H:%M')}\\n\\nДальше: ✅ Отметить выполненное",
-        reply_markup=employee_menu(),
-    )
-    context.user_data.clear()
+    await msg.reply_text("✅ Принято. Задача закрыта с фото.")
+    # show menu
+    u = users.get(str(uid), {})
+    await msg.reply_text("Меню:", reply_markup=main_menu_kb(u))
     return ConversationHandler.END
 
 
-# -------------------- Error handler --------------------
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error: %s", context.error)
+# ----------------- VIOLATION (NO SPAM) -----------------
+
+def violation_key(slot_id: str, vtype: str) -> str:
+    return f"{slot_id}::{vtype}"
 
 
-# -------------------- Build app --------------------
+def already_sent(slot_id: str, vtype: str) -> bool:
+    v = load_violations()
+    sent = v.get("sent", {})
+    return bool(sent.get(violation_key(slot_id, vtype)))
+
+
+def set_sent(slot_id: str, vtype: str, value: bool = True):
+    v = load_violations()
+    sent = v.setdefault("sent", {})
+    key = violation_key(slot_id, vtype)
+    if value:
+        sent[key] = now_tz().isoformat()
+    else:
+        sent.pop(key, None)
+    v["sent"] = sent
+    save_violations(v)
+
+
+def clear_violation_for_user_slot(uid: int, vtype: str):
+    slot = open_slot_for_user(uid)
+    if not slot:
+        return
+    set_sent(slot["id"], vtype, value=False)
+
+
+# ----------------- SLOT / TRANSFER / REPORT -----------------
+
+async def transfer_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = require_user(update)
+    if not can_use_feature(user, "transfer"):
+        await q.edit_message_text("Нет доступа.")
+        return ConversationHandler.END
+
+    slot = open_slot_for_user(update.effective_user.id)
+    if not slot:
+        await q.edit_message_text("У тебя нет открытого слота.")
+        return ConversationHandler.END
+
+    await q.edit_message_text(
+        "Напиши коротко: кому передал точку / комментарий по смене.",
+        reply_markup=None,
+    )
+    return TRANSFER_WAIT_COMMENT
+
+
+async def transfer_wait_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    users = load_users()
+    name = user_name(users, uid)
+
+    slot = open_slot_for_user(uid)
+    if not slot:
+        await update.message.reply_text("Слот уже закрыт.")
+        return ConversationHandler.END
+
+    slots = load_slots()
+    slot["status"] = "closed"
+    slot["ended_at"] = now_tz().isoformat()
+    slot["transfer_comment"] = text
+    slots[slot["id"]] = slot
+    save_slots(slots)
+
+    # notify control
+    if CONTROL_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=CONTROL_CHAT_ID,
+                text=f"🔁 Передача точки: {slot['point']} | {name} ({uid})\nКомментарий: {text}",
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text("✅ Ок, слот закрыт. Спасибо.")
+    await update.message.reply_text("Меню:", reply_markup=main_menu_kb(users.get(str(uid), {})))
+    return ConversationHandler.END
+
+
+async def fin_report_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = require_user(update)
+    if not can_use_feature(user, "report"):
+        await q.edit_message_text("Нет доступа.")
+        return ConversationHandler.END
+
+    point = user.get("point")
+    if not point:
+        await q.edit_message_text("Сначала выбери точку.", reply_markup=points_kb("set_point"))
+        return ConversationHandler.END
+
+    # Gate: only after close time
+    if not after_close_now(point):
+        close_t = point_close_time(point).strftime("%H:%M")
+        await q.edit_message_text(
+            f"⛔ Фин. отчёт можно сдавать только после закрытия точки.\n"
+            f"Для <b>{html_escape(point)}</b> это после <b>{close_t}</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_kb(user),
+        )
+        return ConversationHandler.END
+
+    day = today_key()
+    # start report flow
+    context.user_data["r_point"] = point
+    context.user_data["r_day"] = day
+
+    await q.edit_message_text(f"Фин. отчёт ({html_escape(point)}). Введи сумму НАЛИЧКА (число).", parse_mode=ParseMode.HTML)
+    return REPORT_CASH
+
+
+async def report_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip().replace(" ", "").replace(",", ".")
+    if not re.match(r"^\d+(\.\d+)?$", t):
+        await update.message.reply_text("Нужно число. Например 12345")
+        return REPORT_CASH
+    context.user_data["r_cash"] = float(t)
+    await update.message.reply_text("Введи сумму БЕЗНАЛ (число).")
+    return REPORT_CASHLESS
+
+
+async def report_cashless(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip().replace(" ", "").replace(",", ".")
+    if not re.match(r"^\d+(\.\d+)?$", t):
+        await update.message.reply_text("Нужно число. Например 12345")
+        return REPORT_CASHLESS
+    context.user_data["r_cashless"] = float(t)
+    await update.message.reply_text("Пришли 1-2 фото чеков (можно одним сообщением). Начни с первого фото.")
+    context.user_data["r_photos"] = []
+    return REPORT_PHOTO
+
+
+async def report_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg.photo:
+        await msg.reply_text("Нужно фото. Пришли фото чека.")
+        return REPORT_PHOTO
+
+    file_id = msg.photo[-1].file_id
+    photos = context.user_data.get("r_photos", [])
+    photos.append(file_id)
+    context.user_data["r_photos"] = photos
+
+    if len(photos) < 2:
+        await msg.reply_text("✅ Принял. Если есть ещё фото чека — пришли второе. Если нет — напиши: ГОТОВО")
+        return REPORT_PHOTO
+
+    await msg.reply_text("✅ Принял 2 фото. Напиши: ГОТОВО")
+    return REPORT_PHOTO
+
+
+async def report_photo_text_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if (update.message.text or "").strip().lower() not in {"готово", "done", "ok"}:
+        await update.message.reply_text("Если фото больше нет — напиши: ГОТОВО")
+        return REPORT_PHOTO
+
+    uid = update.effective_user.id
+    users = load_users()
+    name = user_name(users, uid)
+
+    point = context.user_data.get("r_point")
+    day = context.user_data.get("r_day", today_key())
+    cash = context.user_data.get("r_cash", 0.0)
+    cashless = context.user_data.get("r_cashless", 0.0)
+    photos = context.user_data.get("r_photos", [])
+
+    total = cash + cashless
+
+    reports = load_reports()
+    k = day_point_key(day, point)
+    reports[k] = {
+        "day": day,
+        "point": point,
+        "cash": cash,
+        "cashless": cashless,
+        "total": total,
+        "photos": photos,
+        "by": uid,
+        "by_name": name,
+        "ts": now_tz().isoformat(),
+    }
+    save_reports(reports)
+
+    # close user's open slot if exists
+    slot = open_slot_for_user(uid)
+    if slot:
+        slots = load_slots()
+        slot["status"] = "closed"
+        slot["ended_at"] = now_tz().isoformat()
+        slot["closed_by_report"] = True
+        slots[slot["id"]] = slot
+        save_slots(slots)
+
+    # notify control
+    if CONTROL_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=CONTROL_CHAT_ID,
+                text=(
+                    f"🧾 Фин. отчёт: {point}\n"
+                    f"Наличка: {cash:.2f}\n"
+                    f"Безнал: {cashless:.2f}\n"
+                    f"Итого: {total:.2f}\n"
+                    f"Сдал: {name} ({uid})"
+                ),
+            )
+        except Exception:
+            pass
+
+        # forward photo ids are not accessible here; admin can open in Telegram if needed.
+
+    await update.message.reply_text("✅ Фин. отчёт принят. Спасибо.")
+    await update.message.reply_text("Меню:", reply_markup=main_menu_kb(users.get(str(uid), {})))
+    return ConversationHandler.END
+
+
+# ----------------- REMINDER JOB (no spam) -----------------
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    slots = load_slots()
+    if not slots:
+        return
+
+    users = load_users()
+    day = today_key()
+
+    for slot_id, slot in list(slots.items()):
+        if slot.get("status") != "open":
+            continue
+
+        uid = slot.get("user_id")
+        point = slot.get("point")
+        group = slot.get("group", "A")
+
+        u = users.get(str(uid))
+        if not u or not is_active(u):
+            continue
+
+        # Only remind about cleaning tasks (and only once per violation)
+        rem = remaining_task_indices(day, point, group)
+        if rem:
+            if not already_sent(slot_id, "cleaning_pending"):
+                # message once
+                cleaning = load_cleaning()[day_point_key(day, point)]
+                tasks = cleaning["tasks"]
+                # show a short list of remaining tasks (max 5)
+                sample = [tasks[i] for i in rem[:5]]
+                msg = (
+                    "⚠️ Косяк я снял (не закрыта уборка по твоей зоне) и доложу руководителю.\n"
+                    f"Точка: {point}\n"
+                    f"Зона: {group}\n"
+                    "Осталось:\n• " + "\n• ".join(sample[:5])
+                )
+                try:
+                    await context.bot.send_message(chat_id=uid, text=msg)
+                except Exception:
+                    pass
+                set_sent(slot_id, "cleaning_pending", True)
+        else:
+            # resolved -> clear, so if it appears again later (rare), it can notify again
+            set_sent(slot_id, "cleaning_pending", False)
+
+
+# ----------------- ADMIN (simple) -----------------
+
+async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.edit_message_text("Нет доступа.")
+        return
+
+    await q.edit_message_text(
+        "Админка:\n"
+        "/block <user_id> — заблокировать\n"
+        "/unblock <user_id> — разблокировать\n"
+        "/promote <user_id> — снять limited (полный доступ)\n"
+        "/chatid — узнать chat_id группы\n",
+    )
+
+
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(f"chat_id: {chat.id}")
+
+
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    if not context.args:
+        await update.message.reply_text("Используй: /block 123456")
+        return
+    tid = context.args[0]
+    users = load_users()
+    u = users.get(str(tid))
+    if not u:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    u["active"] = False
+    users[str(tid)] = u
+    save_users(users)
+    await update.message.reply_text(f"✅ Заблокирован {tid}")
+
+
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    if not context.args:
+        await update.message.reply_text("Используй: /unblock 123456")
+        return
+    tid = context.args[0]
+    users = load_users()
+    u = users.get(str(tid))
+    if not u:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    u["active"] = True
+    users[str(tid)] = u
+    save_users(users)
+    await update.message.reply_text(f"✅ Разблокирован {tid}")
+
+
+async def promote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    if not context.args:
+        await update.message.reply_text("Используй: /promote 123456")
+        return
+    tid = context.args[0]
+    users = load_users()
+    u = users.get(str(tid))
+    if not u:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    u["limited"] = False
+    u["confirmed"] = True
+    users[str(tid)] = u
+    save_users(users)
+    await update.message.reply_text(f"✅ Полный доступ выдан {tid}")
+
+
+# ----------------- ROUTING -----------------
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # if user types random text, just show menu (non-intrusive)
+    user = require_user(update)
+    if user and is_active(user):
+        await update.message.reply_text("Меню:", reply_markup=main_menu_kb(user))
+    else:
+        await update.message.reply_text("Нужно /start")
+
+
 def build_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required (.env)")
-
     app = Application.builder().token(BOT_TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^🧾 Фин\. отчёт \(закрыть слот\)$"), on_text),
-            MessageHandler(filters.Regex(r"^🔁 Передать точку$"), on_text),
-        ],
+    # conversations
+    reg_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start_cmd)],
         states={
-            HANDOFF_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handoff_comment)],
-            CLOSE_DEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_dep)],
-            CLOSE_CASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_cash)],
-            CLOSE_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_card)],
-            CLOSE_PHOTO1: [MessageHandler(filters.PHOTO, on_photo)],
-            CLOSE_PHOTO2: [
-                MessageHandler(filters.PHOTO, on_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, close_photo2_text),
+            REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
+            REG_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_code)],
+        },
+        fallbacks=[],
+    )
+
+    mark_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(mark_tasks_cb, pattern=r"^mark_tasks$")],
+        states={
+            MARK_PICK_TASK: [CallbackQueryHandler(pick_task_cb, pattern=r"^do_task:\d+$")],
+            MARK_WAIT_PHOTO: [MessageHandler(filters.PHOTO, mark_wait_photo)],
+        },
+        fallbacks=[],
+        per_message=False,
+    )
+
+    transfer_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(transfer_point_cb, pattern=r"^transfer_point$")],
+        states={
+            TRANSFER_WAIT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_wait_comment)]
+        },
+        fallbacks=[],
+        per_message=False,
+    )
+
+    report_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(fin_report_cb, pattern=r"^fin_report$")],
+        states={
+            REPORT_CASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_cash)],
+            REPORT_CASHLESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_cashless)],
+            REPORT_PHOTO: [
+                MessageHandler(filters.PHOTO, report_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_photo_text_done),
             ],
-            CLOSE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_comment)],
         },
-        fallbacks=[CommandHandler("cancel", close_cancel)],
-        allow_reentry=True,
+        fallbacks=[],
+        per_message=False,
     )
 
+    # callbacks
+    app.add_handler(reg_conv)
+    app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^choose_point$"))
+    app.add_handler(CallbackQueryHandler(set_point_cb, pattern=r"^set_point:"))
+    app.add_handler(CallbackQueryHandler(plan_today_cb, pattern=r"^plan_today$"))
+    app.add_handler(mark_conv)
+    app.add_handler(transfer_conv)
+    app.add_handler(report_conv)
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^admin$"))
 
-    slot_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_callback, pattern=r"^custom:")],
-        states={
-            SLOT_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, slot_time_start)],
-            SLOT_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, slot_time_end)],
-        },
-        fallbacks=[CommandHandler("cancel", close_cancel)],
-        allow_reentry=True,
-    )
+    # admin commands
+    app.add_handler(CommandHandler("chatid", chatid_cmd))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
+    app.add_handler(CommandHandler("promote", promote_cmd))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("block", cmd_block))
-    app.add_handler(CommandHandler("unblock", cmd_unblock))
-    app.add_handler(CommandHandler("chatid", cmd_chatid))
+    # fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
 
-    app.add_handler(slot_conv)
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(conv)
-
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    app.add_error_handler(on_error)
-
-    # Jobs
-    if app.job_queue is None:
-        raise RuntimeError('JobQueue not available. Install: pip install "python-telegram-bot[job-queue]==21.6"')
-
-    app.job_queue.run_repeating(reminder_job, interval=REMINDER_INTERVAL_MIN * 60, first=30)
-    app.job_queue.run_daily(daily_summary_job, time=parse_hhmm(END_OF_DAY_TIME))
+    # job queue reminders
+    if app.job_queue:
+        app.job_queue.run_repeating(reminder_job, interval=REMINDER_INTERVAL_MIN * 60, first=30)
+    else:
+        log.warning("JobQueue not available. Ensure requirements include python-telegram-bot[job-queue].")
 
     return app
 
 
 def main():
-    init_db()
-    build_app().run_polling(close_loop=False)
+    start_health_server()
+    app = build_app()
+    log.info("Starting bot polling...")
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
