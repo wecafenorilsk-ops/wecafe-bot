@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import base64
 import json
-import re
 import logging
 import os
+import re
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -148,75 +148,51 @@ def format_control(title: str, user_name: str, user_id: int, point: str = "", de
         lines.extend(details)
     return "\n".join(lines)
 
-async def report_to_control(context: ContextTypes.DEFAULT_TYPE, text: str, photo_file_id: Optional[str] = None, caption: str = ""):
+async def report_to_control(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    photo_file_id: Optional[str] = None,
+    caption: str = "",
+):
     """Отправляет сообщение (и опционально фото) в группу контроля.
 
-    Важно:
-    - Если Telegram сообщает, что группа "migrated to supergroup", мы автоматически подхватываем новый chat_id в рантайме
-      и продолжаем отправку (но всё равно стоит обновить CONTROL_GROUP_ID в Render Env).
+    Важно: если группа была "мигрирована" в супергруппу, Telegram возвращает ошибку
+    с новым chat_id. Мы пытаемся автоматически подхватить новый id и повторить отправку.
     """
     global CONTROL_GROUP_ID
 
     if not REPORT_TO_CONTROL or CONTROL_GROUP_ID == 0:
         return
 
-    def _maybe_migrated_chat_id(err: Exception) -> Optional[int]:
-        s = str(err) or ""
-        # Telegram обычно пишет: "Group migrated to supergroup. New chat id: -100123..."
-        m = re.search(r"New chat id:\s*(-?\d+)", s)
+    async def _send_once() -> None:
+        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+        if photo_file_id:
+            await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=photo_file_id, caption=caption)
+
+    try:
+        await _send_once()
+        return
+    except Exception as e:
+        msg = str(e)
+        # Telegram: "Group migrated to supergroup. New chat id: -100123..."
+        m = re.search(r"New chat id:\s*(-?\d+)", msg)
         if m:
             try:
-                return int(m.group(1))
+                new_id = int(m.group(1))
             except Exception:
-                return None
-        return None
-
-    async def _send_message(chat_id: int) -> bool:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-            return True
-        except Exception as e:
-            migrated = _maybe_migrated_chat_id(e)
-            if migrated:
-                log.warning("Контроль-группа мигрировала. Новый chat_id=%s (обнови CONTROL_GROUP_ID в Render)", migrated)
-                CONTROL_GROUP_ID = migrated
+                new_id = None
+            if new_id and new_id != CONTROL_GROUP_ID:
+                old_id = CONTROL_GROUP_ID
+                CONTROL_GROUP_ID = new_id
+                log.warning("CONTROL_GROUP_ID migrated: %s -> %s (update Render env to keep it)", old_id, new_id)
                 try:
-                    await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-                    return True
+                    await _send_once()
+                    return
                 except Exception as e2:
-                    log.warning("Не смог отправить сообщение в контроль после миграции: %s", e2)
-                    return False
-            log.warning("Не смог отправить сообщение в контроль: %s", e)
-            return False
+                    log.warning("Не смог отправить в контроль даже после миграции id: %s", e2)
+                    return
 
-    async def _send_photo(chat_id: int) -> bool:
-        if not photo_file_id:
-            return True
-        try:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=caption)
-            return True
-        except Exception as e:
-            migrated = _maybe_migrated_chat_id(e)
-            if migrated:
-                log.warning("Контроль-группа мигрировала. Новый chat_id=%s (обнови CONTROL_GROUP_ID в Render)", migrated)
-                CONTROL_GROUP_ID = migrated
-                try:
-                    await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=photo_file_id, caption=caption)
-                    return True
-                except Exception as e2:
-                    log.warning("Не смог отправить фото в контроль после миграции: %s", e2)
-                    return False
-            log.warning("Не смог отправить фото в контроль: %s", e)
-            return False
-
-    await _send_message(CONTROL_GROUP_ID)
-    if photo_file_id:
-        await _send_photo(CONTROL_GROUP_ID)
-
-
-# -------------------- GOOGLE SHEETS API --------------------
-
-_svc = None
+        log.warning("Не смог отправить сообщение в контроль: %s", e)
 
 def _load_creds():
     if GOOGLE_SHEETS_CREDENTIALS_JSON_B64:
@@ -943,7 +919,8 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     as_document = False
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
-    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+    elif update.message.document:
+        # Иногда чеки шлют как "Файл" (PDF/картинка). Берём file_id как есть.
         file_id = update.message.document.file_id
         as_document = True
     if not file_id:
@@ -1346,7 +1323,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(done_pick_cb, pattern=r"^DONE\|\d+$"))
     app.add_handler(CallbackQueryHandler(cancel_photo_cb, pattern=r"^CANCEL_PHOTO$"))
     app.add_handler(CallbackQueryHandler(photo_help_cb, pattern=r"^HELP_PHOTO$"))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_message))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, photo_message))
 
     app.add_handler(CallbackQueryHandler(open_shift_cb, pattern=r"^OPEN_SHIFT$"))
     app.add_handler(CallbackQueryHandler(open_half_shift_cb, pattern=r"^OPEN_HALF_SHIFT$"))
@@ -1385,8 +1362,6 @@ def main():
                 data = await request.json()
             except Exception:
                 return web.Response(status=400, text="bad json")
-
-            log.info("Webhook update received: update_id=%s keys=%s", data.get("update_id"), list(data.keys())[:8])
 
             try:
                 update = Update.de_json(data, tg_app.bot)
