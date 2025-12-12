@@ -1052,4 +1052,221 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await report_to_control(
         context,
-        format_control("📷 Фото отправлено вне сценария", update.effective_user.full_name, user_
+        format_control("📷 Фото отправлено вне сценария", update.effective_user.full_name, user_id, point=current_point(context, user_id)),
+        photo_file_id=file_id,
+        caption=f"Пользователь прислал фото вне сценария. user_id={user_id}",
+    )
+
+
+async def open_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    point = current_point(context, user_id)
+    log_shift(user_id, point, "OPEN_SHIFT")
+    await q.edit_message_text(f"Смена открыта ✅\nТочка: {point}", reply_markup=main_menu(user_id))
+
+    await report_to_control(
+        context,
+        format_control("🔓 Открытие смены", q.from_user.full_name, user_id, point=point),
+    )
+
+
+async def close_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Закрытие смены с двумя фото чеков и проверкой плана уборки."""
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    has_open, point = get_last_shift_state(user_id)
+    if not has_open or not point:
+        await q.edit_message_text("У тебя сейчас нет открытой смены 🤔", reply_markup=main_menu(user_id))
+        return
+
+    tasks = load_tasks_for_today(point)
+    done_ids = get_done_task_ids_for_today(point, user_id)
+    missing = [t.task_name for t in tasks if t.task_id not in done_ids]
+
+    context.user_data["closing_shift"] = {"point": point, "missing_names": missing}
+    context.user_data["await_photo_mode"] = "CLOSE_SHIFT1"
+
+    await q.edit_message_text(
+        "Перед закрытием смены пришли, пожалуйста, ДВА фото чеков:\n"
+        "1️⃣ Фото чека ОТКРЫТИЯ смены\n"
+        "2️⃣ Фото чека ЗАКРЫТИЯ смены\n\n"
+        "Сначала отправь первый чек фото сообщением.",
+        reply_markup=main_menu(user_id),
+    )
+
+    await report_to_control(
+        context,
+        format_control(
+            "🔒 Начато закрытие смены (ждём 2 фото чеков)",
+            q.from_user.full_name,
+            user_id,
+            point=point,
+            details=[f"Невыполненных задач: {len(missing)}"],
+        ),
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Ошибка: %s", context.error)
+
+
+# -------------------- HEALTH --------------------
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+def start_health_server():
+    if not ENABLE_HEALTH:
+        return
+
+    def _run():
+        srv = HTTPServer((HEALTH_HOST, HEALTH_PORT), HealthHandler)
+        log.info("Health: http://%s:%s/healthz", HEALTH_HOST, HEALTH_PORT)
+        srv.serve_forever()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# -------------------- APP --------------------
+
+
+def build_app() -> Application:
+    require_env()
+
+    try:
+        ensure_logs()
+    except HttpError as e:
+        raise RuntimeError(
+            "Не получилось подключиться к таблице.\n"
+            "Проверь:\n"
+            "1) SPREADSHEET_ID\n"
+            "2) что сервис-аккаунт добавлен в «Поделиться» как Редактор\n"
+            f"\nОшибка: {e}"
+        ) from e
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    reg_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start_cmd)],
+        states={
+            GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name)],
+            GET_POINT: [CallbackQueryHandler(handle_reg_point, pattern=r"^REGPOINT\|\d+$")],
+        },
+        fallbacks=[CommandHandler("menu", menu_cmd)],
+    )
+    app.add_handler(reg_conv)
+
+    app.add_handler(CommandHandler("menu", menu_cmd))
+
+    app.add_handler(CallbackQueryHandler(back_menu_cb, pattern=r"^BACK_MENU$"))
+    app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
+    app.add_handler(CallbackQueryHandler(set_point_cb, pattern=r"^POINT\|\d+$"))
+
+    app.add_handler(CallbackQueryHandler(view_plan_cb, pattern=r"^VIEW_PLAN$"))
+
+    app.add_handler(CallbackQueryHandler(mark_done_cb, pattern=r"^MARK_DONE$"))
+    app.add_handler(CallbackQueryHandler(done_pick_cb, pattern=r"^DONE\|\d+$"))
+    app.add_handler(CallbackQueryHandler(cancel_photo_cb, pattern=r"^CANCEL_PHOTO$"))
+    app.add_handler(CallbackQueryHandler(photo_help_cb, pattern=r"^HELP_PHOTO$"))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_message))
+
+    app.add_handler(CallbackQueryHandler(open_shift_cb, pattern=r"^OPEN_SHIFT$"))
+    app.add_handler(CallbackQueryHandler(close_shift_cb, pattern=r"^CLOSE_SHIFT$"))
+
+    app.add_error_handler(error_handler)
+
+    # Планировщик напоминаний
+    if ENABLE_REMINDERS and app.job_queue:
+        interval = max(5, REMINDER_INTERVAL_MINUTES) * 60
+        app.job_queue.run_repeating(reminders_job, interval=interval, first=interval, name="cleaning_reminders")
+        log.info("Reminders enabled: every %s minutes", REMINDER_INTERVAL_MINUTES)
+    else:
+        log.info("Reminders disabled or JobQueue not available")
+
+    return app
+
+
+def main():
+    tg_app = build_app()
+
+    log.info(
+        "BOOT: WEBHOOK_MODE=%s BASE=%s PATH=%s PORT=%s",
+        WEBHOOK_MODE,
+        WEBHOOK_BASE_URL,
+        WEBHOOK_PATH,
+        os.getenv("PORT"),
+    )
+
+    if WEBHOOK_MODE:
+        if not WEBHOOK_BASE_URL:
+            raise RuntimeError("WEBHOOK_BASE_URL is empty (set it in Render Environment)")
+
+        port = int(os.getenv("PORT", "10000"))
+        path = WEBHOOK_PATH
+
+        async def health(_request: web.Request) -> web.Response:
+            return web.Response(text="OK")
+
+        async def webhook_handler(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+            except Exception:
+                return web.Response(status=400, text="bad json")
+
+            try:
+                update = Update.de_json(data, tg_app.bot)
+                await tg_app.update_queue.put(update)
+            except Exception as e:
+                log.exception("Webhook update processing error: %s", e)
+
+            return web.Response(text="OK")
+
+        async def on_startup(_app: web.Application):
+            await tg_app.initialize()
+            await tg_app.start()
+
+            url = f"{WEBHOOK_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+            await tg_app.bot.set_webhook(
+                url=url,
+                drop_pending_updates=False,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            log.info("Webhook mode ON: %s  port=%s", url, port)
+
+        async def on_cleanup(_app: web.Application):
+            # В проде НЕ удаляем webhook на остановке
+            await tg_app.stop()
+            await tg_app.shutdown()
+
+        aio = web.Application()
+        aio.router.add_get("/", health)
+        aio.router.add_get("/health", health)
+        aio.router.add_get("/healthz", health)
+        aio.router.add_post(f"/{path}", webhook_handler)
+        aio.on_startup.append(on_startup)
+        aio.on_cleanup.append(on_cleanup)
+
+        web.run_app(aio, host="0.0.0.0", port=port)
+    else:
+        log.info("Polling mode ON")
+        start_health_server()
+        tg_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
