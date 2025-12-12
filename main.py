@@ -886,12 +886,14 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get("await_photo_mode")
     payload = context.user_data.get("await_photo_task")
 
-    # берём фото или картинку-документ (часто чеки шлют как файл)
+    # берём file_id (как Фото или как файл-картинку)
     file_id = None
+    as_document = False
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
     elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
         file_id = update.message.document.file_id
+        as_document = True
     if not file_id:
         return
 
@@ -908,16 +910,23 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Не смог отправить сообщение в контроль: %s", e)
             try:
-                await context.bot.send_photo(
-                    chat_id=CONTROL_GROUP_ID,
-                    photo=file_id,
-                    caption=f"Фото №1 — точка: {point}",
-                )
-            except Exception:
-                pass
+                if as_document:
+                    await context.bot.send_document(
+                        chat_id=CONTROL_GROUP_ID,
+                        document=file_id,
+                        caption=f"Фото №1 — точка: {point}",
+                    )
+                else:
+                    await context.bot.send_photo(
+                        chat_id=CONTROL_GROUP_ID,
+                        photo=file_id,
+                        caption=f"Фото №1 — точка: {point}",
+                    )
+            except Exception as e:
+                log.warning("Не смог отправить Фото №1 в контроль: %s", e)
 
         # ждём второй чек
         context.user_data["await_photo_mode"] = "CLOSE_SHIFT2"
@@ -941,16 +950,23 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Не смог отправить сообщение в контроль: %s", e)
             try:
-                await context.bot.send_photo(
-                    chat_id=CONTROL_GROUP_ID,
-                    photo=file_id,
-                    caption=f"Фото №2 — точка: {point}",
-                )
-            except Exception:
-                pass
+                if as_document:
+                    await context.bot.send_document(
+                        chat_id=CONTROL_GROUP_ID,
+                        document=file_id,
+                        caption=f"Фото №2 — точка: {point}",
+                    )
+                else:
+                    await context.bot.send_photo(
+                        chat_id=CONTROL_GROUP_ID,
+                        photo=file_id,
+                        caption=f"Фото №2 — точка: {point}",
+                    )
+            except Exception as e:
+                log.warning("Не смог отправить Фото №2 в контроль: %s", e)
 
         # Логируем закрытие смены
         log_shift(user_id, point, "CLOSE_SHIFT")
