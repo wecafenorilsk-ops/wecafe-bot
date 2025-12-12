@@ -1171,7 +1171,7 @@ if WEBHOOK_MODE:
 
     log.info(f"Webhook mode ON: {BASE_URL}/{PATH}  port={PORT}")
 
-    application.run_webhook(
+    app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=PATH,
