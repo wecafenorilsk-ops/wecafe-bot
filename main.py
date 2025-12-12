@@ -1156,7 +1156,32 @@ def build_app() -> Application:
 def main():
     start_health_server()
     app = build_app()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # --- START BOT (Polling or Webhook) ---
+import os
+
+WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0") == "1"
+
+if WEBHOOK_MODE:
+    PORT = int(os.getenv("PORT", "10000"))
+    BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+    PATH = os.getenv("WEBHOOK_PATH", "webhook").lstrip("/")
+
+    if not BASE_URL:
+        raise RuntimeError("WEBHOOK_BASE_URL is empty (set it in Render Environment)")
+
+    log.info(f"Webhook mode ON: {BASE_URL}/{PATH}  port={PORT}")
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=PATH,
+        webhook_url=f"{BASE_URL}/{PATH}",
+        drop_pending_updates=True,
+    )
+else:
+    log.info("Polling mode ON")
+    application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
