@@ -1180,7 +1180,7 @@ if WEBHOOK_MODE:
     )
 else:
     log.info("Polling mode ON")
-    application.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
