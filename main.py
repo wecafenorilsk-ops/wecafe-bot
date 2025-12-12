@@ -570,7 +570,7 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
     for uid, name, _default_point in active_users:
         point = open_map.get(uid)
         if not point:
-            continue  # смена не открыта
+            continue
 
         tasks = load_tasks_for_today(point)
         if not tasks:
@@ -598,7 +598,6 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main_menu(user_id: int) -> InlineKeyboardMarkup:
-    """Главное меню, зависящее от того, открыта ли смена."""
     has_open, _last_point = get_last_shift_state(user_id)
 
     rows: List[List[InlineKeyboardButton]] = []
@@ -909,7 +908,6 @@ async def photo_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка входящего фото."""
     user_id = update.effective_user.id
     mode = context.user_data.get("await_photo_mode")
     payload = context.user_data.get("await_photo_task")
@@ -923,7 +921,6 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not file_id:
         return
 
-    # 1) Фото для закрытия смены — первый чек
     if mode == "CLOSE_SHIFT1":
         closing = context.user_data.get("closing_shift") or {}
         point = closing.get("point", current_point(context, user_id))
@@ -950,7 +947,6 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 2) Фото для закрытия смены — второй чек
     if mode == "CLOSE_SHIFT2":
         closing = context.user_data.get("closing_shift") or {}
         point = closing.get("point", current_point(context, user_id))
@@ -1002,7 +998,6 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(base, reply_markup=main_menu(user_id))
         return
 
-    # 3) Фото для задачи уборки
     if mode == "TASK" and payload:
         point = current_point(context, user_id)
         task = Task(
@@ -1042,7 +1037,6 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 4) Бот фото не ждёт
     await update.message.reply_text(
         "Фото получил 👍\n"
         "Но сейчас я ни с какой задачей и сменой фото не жду.\n"
@@ -1074,7 +1068,6 @@ async def open_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def close_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Закрытие смены с двумя фото чеков и проверкой плана уборки."""
     q = update.callback_query
     await q.answer()
 
@@ -1190,7 +1183,6 @@ def build_app() -> Application:
 
     app.add_error_handler(error_handler)
 
-    # Планировщик напоминаний
     if ENABLE_REMINDERS and app.job_queue:
         interval = max(5, REMINDER_INTERVAL_MINUTES) * 60
         app.job_queue.run_repeating(reminders_job, interval=interval, first=interval, name="cleaning_reminders")
@@ -1249,9 +1241,9 @@ def main():
             log.info("Webhook mode ON: %s  port=%s", url, port)
 
         async def on_cleanup(_app: web.Application):
-            # В проде НЕ удаляем webhook на остановке
-            await tg_app.stop()
-            await tg_app.shutdown()
+            # КРИТИЧНО: НИЧЕГО НЕ ДЕЛАЕМ.
+            # stop()/shutdown() у PTB могут инициировать deleteWebhook -> ты это и видишь в логах.
+            return
 
         aio = web.Application()
         aio.router.add_get("/", health)
