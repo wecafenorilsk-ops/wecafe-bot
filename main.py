@@ -1156,10 +1156,9 @@ def build_app() -> Application:
 def main():
     import os
 
-    # 1) Сначала создаём приложение (ВАЖНО: app появляется тут)
+    # Создаём приложение
     app = build_app()
 
-    # 2) Режим запуска
     webhook_mode = os.getenv("WEBHOOK_MODE", "0") == "1"
 
     if webhook_mode:
