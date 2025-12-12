@@ -4,7 +4,7 @@
 """
 WeCafe Cleaning Bot (Telegram) — адаптирован под твою таблицу
 
-Твои листы (как на скрине):
+Твои листы:
 - cleaning_schedule  (план задач: task_id, task_name, point, photo_required, D1..D31)
 - users             (пользователи бота)
 - points            (список точек)
@@ -13,7 +13,7 @@ WeCafe Cleaning Bot (Telegram) — адаптирован под твою таб
 
 Бот создаёт только 2 новых листа, если их нет:
 - done_log          (что отметили выполненным)
-- shift_log         (открытие смены)
+- shift_log         (открытие/закрытие смены)
 
 ВАЖНО:
 - Google JSON-ключ НЕ лежит рядом с кодом. Он берётся из переменной окружения.
@@ -26,19 +26,17 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
-
-from aiohttp import web
 
 import pytz
+from aiohttp import web
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
@@ -67,6 +65,7 @@ TIME_ZONE = os.getenv("TIME_ZONE", "Europe/Moscow").strip()
 ENABLE_HEALTH = os.getenv("ENABLE_HEALTH", "1").strip() != "0"
 HEALTH_HOST = os.getenv("HEALTH_HOST", "127.0.0.1").strip()
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080").strip() or "8080")
+
 CONTROL_GROUP_ID = int(os.getenv("CONTROL_GROUP_ID", "0").strip() or "0")
 REPORT_TO_CONTROL = os.getenv("REPORT_TO_CONTROL", "1").strip() != "0"
 
@@ -100,6 +99,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("wecafe-bot")
 
 # -------------------- HELPERS --------------------
+
 
 def now_tz() -> datetime:
     return datetime.now(pytz.timezone(TIME_ZONE))
@@ -143,7 +143,13 @@ def require_env():
         raise RuntimeError("Проблемы с настройкой ENV: " + "; ".join(problems))
 
 
-def format_control(title: str, user_name: str, user_id: int, point: str = "", details: Optional[List[str]] = None) -> str:
+def format_control(
+    title: str,
+    user_name: str,
+    user_id: int,
+    point: str = "",
+    details: Optional[List[str]] = None,
+) -> str:
     lines = [title, f"Сотрудник: {user_name} ({user_id})"]
     if point:
         lines.append(f"Точка: {point}")
@@ -165,7 +171,6 @@ async def report_to_control(
         await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
     except Exception as e:
         log.warning("Не смог отправить сообщение в контроль: %s", e)
-
     if photo_file_id:
         try:
             await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=photo_file_id, caption=caption)
@@ -253,15 +258,14 @@ def is_header(row: List[str], must_include: str) -> bool:
 
 # -------------------- DATA: POINTS --------------------
 
+
 def load_points() -> List[str]:
     rows = sheet_get(SHEET_POINTS)
     if not rows:
-        # fallback
         return ["69 Параллель", "Арена", "Кафе Музей"]
 
-    # берём первую колонку
     start = 1 if is_header(rows[0], "point") else 0
-    pts = []
+    pts: List[str] = []
     for r in rows[start:]:
         if r and r[0].strip():
             pts.append(r[0].strip())
@@ -269,6 +273,7 @@ def load_points() -> List[str]:
 
 
 # -------------------- DATA: USERS --------------------
+
 
 def get_user_row_and_index(user_id: int) -> Tuple[Optional[List[str]], Optional[int], bool]:
     rows = sheet_get(SHEET_USERS)
@@ -281,8 +286,7 @@ def get_user_row_and_index(user_id: int) -> Tuple[Optional[List[str]], Optional[
     for i, row in enumerate(rows[start:], start=1 + start):
         if len(row) >= 1 and row[0] == str(user_id):
             return row, i, has_header
-        # поддержка старых форматов
-        if len(row) >= 2 and row[1] == str(user_id):
+        if len(row) >= 2 and row[1] == str(user_id):  # поддержка старых форматов
             return row, i, has_header
 
     return None, None, has_header
@@ -292,10 +296,8 @@ def is_user_active(user_id: int) -> bool:
     row, _, _ = get_user_row_and_index(user_id)
     if not row:
         return False
-    # новый формат: статус в D
     if len(row) >= 4 and row[0] == str(user_id):
         return row[3] == "Активен"
-    # старый формат
     if len(row) >= 4:
         return row[3] == "Активен"
     return False
@@ -305,7 +307,6 @@ def get_user_point(user_id: int) -> Optional[str]:
     row, _, _ = get_user_row_and_index(user_id)
     if not row:
         return None
-    # новый формат: point в C
     if len(row) >= 3 and row[0] == str(user_id):
         return row[2]
     return None
@@ -340,6 +341,7 @@ def set_user_point(user_id: int, point: str):
 
 # -------------------- DATA: SCHEDULE --------------------
 
+
 @dataclass
 class Task:
     task_id: str
@@ -372,7 +374,6 @@ def load_tasks_for_today(point_selected: str) -> List[Task]:
 
     tasks: List[Task] = []
     for r in rows[1:]:
-        # ожидаем минимум: task_id, task_name, point, photo_required, + day column
         if len(r) <= max(3, day_idx):
             continue
         task_id = r[0].strip() if len(r) > 0 else ""
@@ -394,8 +395,8 @@ def load_tasks_for_today(point_selected: str) -> List[Task]:
 
 # -------------------- LOGS --------------------
 
+
 def ensure_logs():
-    # создаём листы логов (не трогаем твои shift_totals)
     ensure_sheet_exists(SHEET_DONE)
     ensure_sheet_exists(SHEET_SHIFT)
     ensure_header(SHEET_USERS, USERS_HEADER)
@@ -476,6 +477,7 @@ def get_last_shift_state(user_id: int) -> tuple[bool, str]:
 
 
 # -------------------- REMINDERS --------------------
+
 
 def load_active_users() -> List[Tuple[int, str, str]]:
     """Активные пользователи из листа users: (user_id, name, point)."""
@@ -565,7 +567,7 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
 
     done_map = get_done_ids_map_for_today(today)
 
-    for uid, name, default_point in active_users:
+    for uid, name, _default_point in active_users:
         point = open_map.get(uid)
         if not point:
             continue  # смена не открыта
@@ -594,12 +596,12 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- UI --------------------
 
+
 def main_menu(user_id: int) -> InlineKeyboardMarkup:
     """Главное меню, зависящее от того, открыта ли смена."""
-    has_open, last_point = get_last_shift_state(user_id)
+    has_open, _last_point = get_last_shift_state(user_id)
 
-    rows = []
-    # Кнопка выбора точки: только когда смена ЗАКРЫТА
+    rows: List[List[InlineKeyboardButton]] = []
     if not has_open:
         rows.append([InlineKeyboardButton("📍 Выбор точки", callback_data="CHOOSE_POINT")])
 
@@ -607,7 +609,6 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("✅ Отметить выполненное", callback_data="MARK_DONE")])
     rows.append([InlineKeyboardButton("📸 Отправить фото для отметки", callback_data="HELP_PHOTO")])
 
-    # Кнопка смены: либо открыть, либо закрыть
     if has_open:
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE_SHIFT")])
     else:
@@ -623,7 +624,7 @@ def points_keyboard(points: List[str], prefix: str) -> InlineKeyboardMarkup:
 
 
 def tasks_keyboard(tasks: List[Task]) -> InlineKeyboardMarkup:
-    btns = []
+    btns: List[List[InlineKeyboardButton]] = []
     for i, t in enumerate(tasks):
         icon = "📸 " if t.photo_required else ""
         label = f"{icon}{t.task_name}"
@@ -636,6 +637,19 @@ def tasks_keyboard(tasks: List[Task]) -> InlineKeyboardMarkup:
 
 # -------------------- HANDLERS --------------------
 
+
+def current_point(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    p = context.user_data.get("point")
+    if p:
+        return p
+    p = get_user_point(user_id)
+    if p:
+        context.user_data["point"] = p
+        return p
+    pts = load_points()
+    return pts[0] if pts else "ALL"
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -644,6 +658,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p:
             context.user_data["point"] = p
         await update.message.reply_text("Привет! Я тебя узнал 🙂\nМеню:", reply_markup=main_menu(user_id))
+
         point = current_point(context, user_id)
         await report_to_control(
             context,
@@ -720,21 +735,321 @@ async def back_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def current_point(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
-    p = context.user_data.get("point")
-    if p:
-        return p
-    p = get_user_point(user_id)
-    if p:
-        context.user_data["point"] = p
-        return p
-    pts = load_points()
-    return pts[0] if pts else "ALL"
-
-
 async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     pts = load_points()
     context.user_data["points_list"] = pts
-    await q.edit_message_text("Выбери точку:", reply_markup=points_keyboard(
+    await q.edit_message_text("Выбери точку:", reply_markup=points_keyboard(pts, prefix="POINT"))
+
+
+async def set_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    pts = context.user_data.get("points_list") or load_points()
+    try:
+        _, idx_s = q.data.split("|", 1)
+        idx = int(idx_s)
+        point = pts[idx]
+    except Exception:
+        await q.edit_message_text("Не понял выбор. Давай ещё раз:", reply_markup=points_keyboard(pts, prefix="POINT"))
+        return
+
+    user_id = q.from_user.id
+    set_user_point(user_id, point)
+    context.user_data["point"] = point
+    await q.edit_message_text(f"Ок! Точка теперь: {point}", reply_markup=main_menu(user_id))
+
+    await report_to_control(
+        context,
+        format_control("📍 Смена точки", q.from_user.full_name, user_id, point=point),
+    )
+
+
+async def view_plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    point = current_point(context, user_id)
+
+    tasks = load_tasks_for_today(point)
+    col = day_column_name()
+
+    if not tasks:
+        await q.edit_message_text(
+            f"На сегодня задач нет 🙂\n(колонка {col})",
+            reply_markup=main_menu(user_id),
+        )
+        return
+
+    done_ids = get_done_task_ids_for_today(point, user_id)
+
+    lines: List[str] = []
+    for t in tasks:
+        status = "✅" if t.task_id in done_ids else "⬜"
+        photo_icon = " 📸" if t.photo_required else ""
+        lines.append(f"{status} {t.task_name}{photo_icon}")
+
+    text = f"План на сегодня ({day_key()}, колонка {col}):\n" + "\n".join(lines)
+    await q.edit_message_text(text, reply_markup=main_menu(user_id))
+
+    await report_to_control(
+        context,
+        format_control(
+            "🧾 Просмотр плана уборки",
+            q.from_user.full_name,
+            user_id,
+            point=point,
+            details=[f"Колонка: {col}"],
+        ),
+    )
+
+
+async def mark_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    point = current_point(context, user_id)
+    tasks = load_tasks_for_today(point)
+
+    if not tasks:
+        await q.edit_message_text("Сегодня нечего отмечать 🙂", reply_markup=main_menu(user_id))
+        return
+
+    done_ids = get_done_task_ids_for_today(point, user_id)
+    remaining = [t for t in tasks if t.task_id not in done_ids]
+
+    if not remaining:
+        await q.edit_message_text("Все задачи на сегодня уже отмечены ✅", reply_markup=main_menu(user_id))
+        return
+
+    context.user_data["today_tasks"] = remaining
+    await q.edit_message_text("Что выполнено? Нажми на задачу:", reply_markup=tasks_keyboard(remaining))
+
+
+async def done_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    point = current_point(context, user_id)
+
+    tasks: List[Task] = context.user_data.get("today_tasks", [])
+    try:
+        _, idx_s = q.data.split("|", 1)
+        idx = int(idx_s)
+        task = tasks[idx]
+    except Exception:
+        await q.edit_message_text(
+            "Я запутался 😅 Нажми «Отметить выполненное» ещё раз.",
+            reply_markup=main_menu(user_id),
+        )
+        return
+
+    if task.photo_required:
+        context.user_data["await_photo_mode"] = "TASK"
+        context.user_data["await_photo_task"] = {
+            "task_id": task.task_id,
+            "task_name": task.task_name,
+            "photo_required": True,
+        }
+        await q.edit_message_text(
+            "Эта задача требует фото 📸\n\n"
+            "Сейчас просто отправь мне ОДНО фото сообщением.\n"
+            "После фото я сам запишу отметку.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="CANCEL_PHOTO")]]),
+        )
+        return
+
+    log_done(user_id, point, task, photo_file_id="")
+    await q.edit_message_text(f"Записал ✅\n{task.task_name}", reply_markup=main_menu(user_id))
+
+    await report_to_control(
+        context,
+        format_control(
+            "✅ Уборка выполнена (без фото)",
+            q.from_user.full_name,
+            user_id,
+            point=point,
+            details=[f"Задача: {task.task_name}"],
+        ),
+    )
+
+
+async def cancel_photo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    context.user_data.pop("await_photo_task", None)
+    context.user_data.pop("await_photo_mode", None)
+    await q.edit_message_text("Ок, отменил. Меню:", reply_markup=main_menu(user_id))
+
+
+async def photo_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    point = current_point(context, user_id)
+    await q.edit_message_text(
+        "Как отправить фото:\n"
+        "1) Нажми «Отметить выполненное»\n"
+        "2) Выбери задачу с значком 📸\n"
+        "3) Потом отправь фото обычным сообщением\n\n"
+        "Я сам всё запишу в таблицу ✅",
+        reply_markup=main_menu(user_id),
+    )
+
+    await report_to_control(
+        context,
+        format_control("ℹ️ Открыта справка по фото", q.from_user.full_name, user_id, point=point),
+    )
+
+
+async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка входящего фото."""
+    user_id = update.effective_user.id
+    mode = context.user_data.get("await_photo_mode")
+    payload = context.user_data.get("await_photo_task")
+
+    file_id: Optional[str] = None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        file_id = update.message.document.file_id
+
+    if not file_id:
+        return
+
+    # 1) Фото для закрытия смены — первый чек
+    if mode == "CLOSE_SHIFT1":
+        closing = context.user_data.get("closing_shift") or {}
+        point = closing.get("point", current_point(context, user_id))
+
+        if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
+            text = (
+                "🧾 Чек 1 (открытие смены)\n"
+                f"Точка: {point}\n"
+                f"Сотрудник: {user_id}"
+            )
+            try:
+                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+            except Exception:
+                pass
+            try:
+                await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=file_id, caption=f"Чек 1 — точка: {point}")
+            except Exception:
+                pass
+
+        context.user_data["await_photo_mode"] = "CLOSE_SHIFT2"
+        await update.message.reply_text(
+            "Принял первый чек ✅\nТеперь пришли фото ЧЕКА ЗАКРЫТИЯ смены.",
+            reply_markup=main_menu(user_id),
+        )
+        return
+
+    # 2) Фото для закрытия смены — второй чек
+    if mode == "CLOSE_SHIFT2":
+        closing = context.user_data.get("closing_shift") or {}
+        point = closing.get("point", current_point(context, user_id))
+        missing = closing.get("missing_names", [])
+
+        if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
+            text = (
+                "🧾 Чек 2 (закрытие смены)\n"
+                f"Точка: {point}\n"
+                f"Сотрудник: {user_id}"
+            )
+            try:
+                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+            except Exception:
+                pass
+            try:
+                await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=file_id, caption=f"Чек 2 — точка: {point}")
+            except Exception:
+                pass
+
+        log_shift(user_id, point, "CLOSE_SHIFT")
+
+        base = f"Смена закрыта ✅\nТочка: {point}"
+        if missing:
+            base += "\n\n⚠️ План уборки выполнен не полностью. Это косяк 😈\nНе отмечены задачи:"
+            for name in missing:
+                base += f"\n• {name}"
+        else:
+            base += "\n\nПлан уборки выполнен полностью 💪"
+
+        details: List[str] = []
+        if missing:
+            details.append("⚠️ Косяк: план уборки НЕ полностью")
+            for n in missing[:15]:
+                details.append(f"• {n}")
+            if len(missing) > 15:
+                details.append("…")
+        else:
+            details.append("✅ План уборки полностью")
+
+        await report_to_control(
+            context,
+            format_control("🔒 Закрытие смены", update.effective_user.full_name, user_id, point=point, details=details),
+        )
+
+        context.user_data.pop("closing_shift", None)
+        context.user_data.pop("await_photo_mode", None)
+
+        await update.message.reply_text(base, reply_markup=main_menu(user_id))
+        return
+
+    # 3) Фото для задачи уборки
+    if mode == "TASK" and payload:
+        point = current_point(context, user_id)
+        task = Task(
+            task_id=payload["task_id"],
+            task_name=payload["task_name"],
+            point=point,
+            photo_required=True,
+        )
+        log_done(user_id, point, task, photo_file_id=file_id)
+
+        if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
+            text = (
+                "📸 Уборка выполнена (с фото)\n"
+                f"Точка: {point}\n"
+                f"Сотрудник: {user_id}\n"
+                f"Задача: {task.task_name}"
+            )
+            try:
+                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+            except Exception:
+                pass
+            try:
+                await context.bot.send_photo(
+                    chat_id=CONTROL_GROUP_ID,
+                    photo=file_id,
+                    caption=f"Точка: {point}\nЗадача: {task.task_name}",
+                )
+            except Exception:
+                pass
+
+        context.user_data.pop("await_photo_task", None)
+        context.user_data.pop("await_photo_mode", None)
+
+        await update.message.reply_text(
+            f"Готово ✅ Фото записал и отметил задачу:\n{task.task_name}",
+            reply_markup=main_menu(user_id),
+        )
+        return
+
+    # 4) Бот фото не ждёт
+    await update.message.reply_text(
+        "Фото получил 👍\n"
+        "Но сейчас я ни с какой задачей и сменой фото не жду.\n"
+        "Нажми «Отметить выполненное» или кнопку закрытия смены в меню.",
+        reply_markup=main_menu(user_id),
+    )
+
+    await report_to_control(
+        context,
+        format_control("📷 Фото отправлено вне сценария", update.effective_user.full_name, user_
