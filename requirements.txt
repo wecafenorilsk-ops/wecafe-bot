@@ -5,3 +5,4 @@ tzdata==2025.2
 google-auth==2.36.0
 google-api-python-client==2.154.0
 pytz==2024.2
+aiohttp==3.10.11
