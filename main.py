@@ -1154,33 +1154,38 @@ def build_app() -> Application:
     return app
 
 def main():
-    start_health_server()
+    import os
+
+    # 1) Сначала создаём приложение (ВАЖНО: app появляется тут)
     app = build_app()
-    # --- START BOT (Polling or Webhook) ---
-import os
 
-WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0") == "1"
+    # 2) Режим запуска
+    webhook_mode = os.getenv("WEBHOOK_MODE", "0") == "1"
 
-if WEBHOOK_MODE:
-    PORT = int(os.getenv("PORT", "10000"))
-    BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
-    PATH = os.getenv("WEBHOOK_PATH", "webhook").lstrip("/")
+    if webhook_mode:
+        port = int(os.getenv("PORT", "10000"))
+        base_url = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+        path = os.getenv("WEBHOOK_PATH", "webhook").lstrip("/")
 
-    if not BASE_URL:
-        raise RuntimeError("WEBHOOK_BASE_URL is empty (set it in Render Environment)")
+        if not base_url:
+            raise RuntimeError("WEBHOOK_BASE_URL is empty (set it in Render Environment)")
 
-    log.info(f"Webhook mode ON: {BASE_URL}/{PATH}  port={PORT}")
+        log.info(f"Webhook mode ON: {base_url}/{path}  port={port}")
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=PATH,
-        webhook_url=f"{BASE_URL}/{PATH}",
-        drop_pending_updates=True,
-    )
-else:
-    log.info("Polling mode ON")
-    app.run_polling(drop_pending_updates=True)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=path,
+            webhook_url=f"{base_url}/{path}",
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        log.info("Polling mode ON")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
 
 
 if __name__ == "__main__":
