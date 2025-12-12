@@ -1168,6 +1168,8 @@ def build_app() -> Application:
 def main():
     # В Render обычно используем webhook, локально можно polling.
     tg_app = build_app()
+log.info("BOOT: WEBHOOK_MODE=%s BASE=%s PATH=%s PORT=%s",
+         WEBHOOK_MODE, WEBHOOK_BASE_URL, WEBHOOK_PATH, os.getenv("PORT"))
 
     if WEBHOOK_MODE:
         if not WEBHOOK_BASE_URL:
@@ -1200,19 +1202,16 @@ def main():
             # ставим webhook
             url = f"{WEBHOOK_BASE_URL}/{path}"
             await tg_app.bot.set_webhook(
-                url=url,
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
+    url=url,
+    drop_pending_updates=False,
+    allowed_updates=Update.ALL_TYPES,
+)
             )
             log.info("Webhook mode ON: %s  port=%s", url, port)
 
         async def on_cleanup(app_: web.Application):
-            try:
-                await tg_app.bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                pass
-            await tg_app.stop()
-            await tg_app.shutdown()
+    await tg_app.stop()
+    await tg_app.shutdown()
 
         aio = web.Application()
         aio.router.add_get("/", health)
