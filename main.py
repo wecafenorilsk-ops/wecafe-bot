@@ -387,15 +387,17 @@ def log_shift(user_id: int, point: str, action: str):
     sheet_append(SHEET_SHIFT, [ts, day_key(), str(user_id), sanitize_for_sheets(point), sanitize_for_sheets(action)])
 
 
-def get_done_task_ids_for_today(point: str, user_id: int) -> set[str]:
-    """Возвращает множества task_id, которые этот пользователь уже закрыл сегодня на точке."""
+def get_done_task_ids_for_today(point: str, user_id: Optional[int] = None) -> set[str]:
+    """Возвращает множество task_id, которые уже закрыты сегодня на точке.
+    Если user_id=None — учитываем отметки всех сотрудников (нужно для передачи смены).
+    """
     try:
         rows = sheet_get(f"{SHEET_DONE}!A2:H")
     except Exception:
         return set()
 
     today = day_key()
-    uid = str(user_id)
+    uid = str(user_id) if user_id is not None else None
     result: set[str] = set()
 
     for r in rows:
@@ -408,9 +410,9 @@ def get_done_task_ids_for_today(point: str, user_id: int) -> set[str]:
         task_id_val = r[4]
         if day_val != today:
             continue
-        if uid_val != uid:
-            continue
         if point_val != point:
+            continue
+        if uid is not None and uid_val != uid:
             continue
         if not task_id_val:
             continue
@@ -419,12 +421,12 @@ def get_done_task_ids_for_today(point: str, user_id: int) -> set[str]:
 
 
 
-def get_last_shift_state(user_id: int) -> tuple[bool, str]:
-    """Возвращает (has_open_shift, last_point) по последней записи в shift_log."""
+def get_last_shift_state(user_id: int) -> tuple[bool, str, str]:
+    """Возвращает (has_open_shift, last_point, last_action) по последней записи в shift_log."""
     try:
         rows = sheet_get(f"{SHEET_SHIFT}!A2:E")
     except Exception:
-        return False, ""
+        return False, "", ""
     last_point = ""
     last_action = ""
     uid = str(user_id)
@@ -435,9 +437,8 @@ def get_last_shift_state(user_id: int) -> tuple[bool, str]:
             continue
         last_point = r[3]
         last_action = r[4]
-    return (last_action == "OPEN_SHIFT"), last_point
-
-
+    open_actions = {"OPEN_SHIFT", "OPEN_HALF_SHIFT", "TRANSFER_IN"}
+    return (last_action in open_actions), last_point, last_action
 # -------------------- REMINDERS --------------------
 
 def load_active_users() -> List[Tuple[int, str, str]]:
@@ -470,6 +471,8 @@ def get_open_shifts_map() -> Dict[int, str]:
     except Exception:
         return {}
     state: Dict[int, str] = {}
+    open_actions = {"OPEN_SHIFT", "OPEN_HALF_SHIFT", "TRANSFER_IN"}
+    close_actions = {"CLOSE_SHIFT", "TRANSFER_OUT"}
     for r in rows:
         if len(r) < 5:
             continue
@@ -479,34 +482,31 @@ def get_open_shifts_map() -> Dict[int, str]:
             continue
         point = r[3] if len(r) > 3 else ""
         action = r[4] if len(r) > 4 else ""
-        if action == "OPEN_SHIFT":
+        if action in open_actions:
             state[uid] = point
-        elif action == "CLOSE_SHIFT":
+        elif action in close_actions:
             state.pop(uid, None)
     return state
 
-def get_done_ids_map_for_today(today: str) -> Dict[Tuple[int, str], set[str]]:
-    """Карта отмеченных задач за сегодня: (user_id, point) -> set(task_id)."""
+
+def get_done_ids_map_for_today(today: str) -> Dict[str, set[str]]:
+    """Карта отмеченных задач за сегодня по точкам: point -> set(task_id)."""
     try:
         rows = sheet_get(f"{SHEET_DONE}!A2:H")
     except Exception:
         return {}
-    out: Dict[Tuple[int, str], set[str]] = {}
+    out: Dict[str, set[str]] = {}
     for r in rows:
         if len(r) < 6:
             continue
         day_val = r[1]
         if day_val != today:
             continue
-        try:
-            uid = int(r[2])
-        except Exception:
-            continue
         point = r[3]
         task_id = r[4]
         if not point or not task_id:
             continue
-        out.setdefault((uid, point), set()).add(task_id)
+        out.setdefault(point, set()).add(task_id)
     return out
 
 async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
@@ -534,7 +534,7 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
         if not tasks:
             continue
 
-        done_ids = done_map.get((uid, point), set())
+        done_ids = done_map.get(point, set())
         remaining = [t for t in tasks if t.task_id not in done_ids]
         if not remaining:
             continue
@@ -557,7 +557,7 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main_menu(user_id: int) -> InlineKeyboardMarkup:
     """Главное меню, зависящее от того, открыта ли смена."""
-    has_open, last_point = get_last_shift_state(user_id)
+    has_open, last_point, last_action = get_last_shift_state(user_id)
 
     rows = []
     # Кнопка выбора точки: только когда смена ЗАКРЫТА
@@ -568,16 +568,31 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("✅ Отметить выполненное", callback_data="MARK_DONE")])
     rows.append([InlineKeyboardButton("📸 Отправить фото для отметки", callback_data="HELP_PHOTO")])
 
-    # Кнопка смены: либо открыть, либо закрыть
+    # Управление сменой
     if has_open:
+        # Передача смены — доступна в сценарии "пол смены"
+        if last_action == "OPEN_HALF_SHIFT":
+            rows.append([InlineKeyboardButton("↪️ Передать смену", callback_data="TRANSFER_SHIFT")])
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE_SHIFT")])
     else:
         rows.append([InlineKeyboardButton("🔓 Открыть смену", callback_data="OPEN_SHIFT")])
+        rows.append([InlineKeyboardButton("🌓 Открыть пол смены", callback_data="OPEN_HALF_SHIFT")])
 
     return InlineKeyboardMarkup(rows)
 
 def points_keyboard(points: List[str], prefix: str) -> InlineKeyboardMarkup:
     btns = [[InlineKeyboardButton(p, callback_data=f"{prefix}|{i}")] for i, p in enumerate(points)]
+    btns.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_MENU")])
+    return InlineKeyboardMarkup(btns)
+
+def transfer_keyboard(users: List[Tuple[int, str]], prefix: str = "TRANSFER") -> InlineKeyboardMarkup:
+    """Клавиатура выбора сотрудника для передачи смены."""
+    btns: List[List[InlineKeyboardButton]] = []
+    for uid, name in users[:30]:
+        label = (name or str(uid)).strip()
+        if len(label) > 40:
+            label = label[:37] + "…"
+        btns.append([InlineKeyboardButton(f"👤 {label}", callback_data=f"{prefix}|{uid}")])
     btns.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_MENU")])
     return InlineKeyboardMarkup(btns)
 
@@ -673,6 +688,12 @@ async def back_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def current_point(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    # если у пользователя сейчас открыта смена — точка берётся из shift_log (важно для передачи смены)
+    has_open, shift_point, _ = get_last_shift_state(user_id)
+    if has_open and shift_point:
+        context.user_data["point"] = shift_point
+        return shift_point
+
     p = context.user_data.get("point")
     if p:
         return p
@@ -732,7 +753,7 @@ async def view_plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Какие задачи уже отмечены этим пользователем на этой точке
-    done_ids = get_done_task_ids_for_today(point, user_id)
+    done_ids = get_done_task_ids_for_today(point, None)
 
     lines: list[str] = []
     for t in tasks:
@@ -766,7 +787,7 @@ async def mark_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Фильтруем уже отмеченные задачи, чтобы нельзя было спамить
-    done_ids = get_done_task_ids_for_today(point, user_id)
+    done_ids = get_done_task_ids_for_today(point, None)
     remaining = [t for t in tasks if t.task_id not in done_ids]
 
     if not remaining:
@@ -881,7 +902,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
             text = (
-                "🧾 Чек 1 (открытие смены)\n"
+                "🧾 Фото №1\n"
                 f"Точка: {point}\n"
                 f"Сотрудник: {user_id}"
             )
@@ -893,7 +914,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(
                     chat_id=CONTROL_GROUP_ID,
                     photo=file_id,
-                    caption=f"Чек 1 — точка: {point}",
+                    caption=f"Фото №1 — точка: {point}",
                 )
             except Exception:
                 pass
@@ -901,7 +922,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ждём второй чек
         context.user_data["await_photo_mode"] = "CLOSE_SHIFT2"
         await update.message.reply_text(
-            "Принял первый чек ✅\nТеперь пришли фото ЧЕКА ЗАКРЫТИЯ смены.",
+            "Принял Фото №1 ✅\nТеперь пришли Фото №2.",
             reply_markup=main_menu(user_id),
         )
         return
@@ -914,7 +935,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
             text = (
-                "🧾 Чек 2 (закрытие смены)\n"
+                "🧾 Фото №2\n"
                 f"Точка: {point}\n"
                 f"Сотрудник: {user_id}"
             )
@@ -926,7 +947,7 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(
                     chat_id=CONTROL_GROUP_ID,
                     photo=file_id,
-                    caption=f"Чек 2 — точка: {point}",
+                    caption=f"Фото №2 — точка: {point}",
                 )
             except Exception:
                 pass
@@ -1021,6 +1042,115 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def open_half_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    point = current_point(context, user_id)
+    log_shift(user_id, point, "OPEN_HALF_SHIFT")
+    await q.edit_message_text(f"Пол смены открыта ✅\nТочка: {point}\n\nКогда закончишь — нажми «Передать смену».", reply_markup=main_menu(user_id))
+
+    await report_to_control(
+        context,
+        format_control("🌓 Открытие ПОЛ смены", q.from_user.full_name, user_id, point=point),
+    )
+
+
+async def transfer_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    has_open, point, last_action = get_last_shift_state(user_id)
+    if not has_open or not point:
+        await q.edit_message_text("У тебя сейчас нет открытой смены 🤔", reply_markup=main_menu(user_id))
+        return
+    if last_action != "OPEN_HALF_SHIFT":
+        await q.edit_message_text(
+            "Передать смену можно только если ты открыл «пол смены» 🌓",
+            reply_markup=main_menu(user_id),
+        )
+        return
+
+    # список активных сотрудников (без себя)
+    active = load_active_users()
+    candidates: List[Tuple[int, str]] = []
+    for uid, name, _p in active:
+        if uid == user_id:
+            continue
+        candidates.append((uid, name or str(uid)))
+
+    if not candidates:
+        await q.edit_message_text("Не нашёл активных сотрудников для передачи 😅", reply_markup=main_menu(user_id))
+        return
+
+    context.user_data["transfer_point"] = point
+    await q.edit_message_text(
+        f"Кому передать смену?\nТочка: {point}",
+        reply_markup=transfer_keyboard(candidates),
+    )
+
+
+async def transfer_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    user_id = q.from_user.id
+    has_open, point, last_action = get_last_shift_state(user_id)
+    if not has_open or not point or last_action != "OPEN_HALF_SHIFT":
+        await q.edit_message_text("Сейчас нечего передавать 🤔", reply_markup=main_menu(user_id))
+        return
+
+    try:
+        _, uid_s = q.data.split("|", 1)
+        new_uid = int(uid_s)
+    except Exception:
+        await q.edit_message_text("Не понял выбор. Попробуй ещё раз.", reply_markup=main_menu(user_id))
+        return
+
+    # фиксируем передачу: у первого сотрудника смена закрыта как TRANSFER_OUT, у второго открыта как TRANSFER_IN
+    log_shift(user_id, point, "TRANSFER_OUT")
+    log_shift(new_uid, point, "TRANSFER_IN")
+
+    # чтобы у второго везде была правильная точка
+    try:
+        set_user_point(new_uid, point)
+    except Exception:
+        pass
+
+    # Имя нового сотрудника
+    new_name = str(new_uid)
+    try:
+        row, _, _ = get_user_row_and_index(new_uid)
+        if row and len(row) > 1 and row[1]:
+            new_name = row[1]
+    except Exception:
+        pass
+
+    await q.edit_message_text(f"Смену передал ✅\nКому: {new_name}\nТочка: {point}", reply_markup=main_menu(user_id))
+
+    # уведомим второго сотрудника
+    try:
+        await context.bot.send_message(
+            chat_id=new_uid,
+            text=f"Тебе передали смену 🧾\nТочка: {point}\n\nВ конце нажми «Закрыть смену» и отправь Фото №1 и Фото №2.",
+            reply_markup=main_menu(new_uid),
+        )
+    except Exception as e:
+        log.warning("Не смог уведомить сотрудника о передаче смены: %s", e)
+
+    await report_to_control(
+        context,
+        format_control(
+            "↪️ Передача смены",
+            q.from_user.full_name,
+            user_id,
+            point=point,
+            details=[f"Передал: {q.from_user.full_name} ({user_id})", f"Принял: {new_name} ({new_uid})"],
+        ),
+    )
+
 async def open_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1043,7 +1173,7 @@ async def close_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     user_id = q.from_user.id
-    has_open, point = get_last_shift_state(user_id)
+    has_open, point, last_action = get_last_shift_state(user_id)
     if not has_open or not point:
         await q.edit_message_text(
             "У тебя сейчас нет открытой смены 🤔",
@@ -1053,7 +1183,7 @@ async def close_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Считаем, какие задачи по плану уборки ещё не отмечены
     tasks = load_tasks_for_today(point)
-    done_ids = get_done_task_ids_for_today(point, user_id)
+    done_ids = get_done_task_ids_for_today(point, None)
     missing = [t.task_name for t in tasks if t.task_id not in done_ids]
 
     # Запомним данные о закрытии смены и попросим 2 фото чеков
@@ -1074,7 +1204,7 @@ async def close_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await report_to_control(
         context,
         format_control(
-            "🔒 Начато закрытие смены (ждём 2 фото чеков)",
+            "🔒 Начато закрытие смены (ждём Фото №1 и Фото №2)",
             q.from_user.full_name,
             user_id,
             point=point,
@@ -1151,6 +1281,9 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_message))
 
     app.add_handler(CallbackQueryHandler(open_shift_cb, pattern=r"^OPEN_SHIFT$"))
+    app.add_handler(CallbackQueryHandler(open_half_shift_cb, pattern=r"^OPEN_HALF_SHIFT$"))
+    app.add_handler(CallbackQueryHandler(transfer_shift_cb, pattern=r"^TRANSFER_SHIFT$"))
+    app.add_handler(CallbackQueryHandler(transfer_pick_cb, pattern=r"^TRANSFER\|\d+$"))
     app.add_handler(CallbackQueryHandler(close_shift_cb, pattern=r"^CLOSE_SHIFT$"))
 
     app.add_error_handler(error_handler)
