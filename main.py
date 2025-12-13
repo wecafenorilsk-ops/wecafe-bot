@@ -1763,9 +1763,10 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=u2.user_id,
-            text=f"Тебе передают смену на точке: {point}
-Нажми «Принять смену». (Точку выбирать не нужно)",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{sess.session_id}")]]),
+            text=f"Тебе передают смену на точке: {point}\nНажми «Принять смену». (Точку выбирать не нужно)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{sess.session_id}")]
+            ]),
         )
     except Exception as e:
         log.warning("Не смог отправить accept user2: %s", e)
