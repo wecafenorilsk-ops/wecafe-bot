@@ -767,7 +767,7 @@ def shift_kb(role: str, point: str) -> InlineKeyboardMarkup:
     ]
     if role == "HALF1":
         rows.append([InlineKeyboardButton("🔁 Передать смену", callback_data="TRANSFER")])
-    if role in ("FULL", "HALF2"):
+    if role in ("FULL", "HALF1", "HALF2"):
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE")])
     return InlineKeyboardMarkup(rows)
 
@@ -1865,8 +1865,8 @@ async def close_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     point = normalize_point(sess.point)
 
-    if role not in ("FULL", "HALF2"):
-        await q.edit_message_text("Закрытие смены доступно только для полной смены или второго сотрудника пол-смены.")
+    if role not in ("FULL", "HALF1", "HALF2"):
+        await q.edit_message_text("Закрытие смены доступно только для полной смены или сотрудников пол-смены.")
         return ConversationHandler.END
 
     # подготовим контекст закрытия
@@ -2028,7 +2028,11 @@ async def close_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mode == "FULL":
             sess.user1_end = ts
         if mode == "HALF":
-            sess.user2_end = ts
+            role = close_ctx.get("role")
+            if role == "HALF1":
+                sess.user1_end = ts
+            else:
+                sess.user2_end = ts
         upsert_session(sess)
 
     # сообщение пользователю
