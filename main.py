@@ -2278,7 +2278,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(help_cb, pattern=r"^HELP$"))
     app.add_handler(CallbackQueryHandler(help_send_cb, pattern=r"^HELP_SEND$"))
     app.add_handler(CallbackQueryHandler(help_cancel_cb, pattern=r"^HELP_CANCEL$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_text_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_text_message), group=1)
 
     app.add_handler(CallbackQueryHandler(transfer_cb, pattern=r"^TRANSFER$"))
     app.add_handler(CallbackQueryHandler(pick_user2_cb, pattern=r"^U2\|\d+$"))
