@@ -748,7 +748,7 @@ def points_kb(points: List[str], prefix: str = "POINT") -> InlineKeyboardMarkup:
 
 
 def after_approved_kb() -> InlineKeyboardMarkup:
-    return kb_single("📍 Выбор точки", "CHOOSE_POINT")
+    return kb_single("📍 Сменить точку", "CHOOSE_POINT")
 
 
 def open_choice_kb() -> InlineKeyboardMarkup:
@@ -979,7 +979,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text="✅ Тебя одобрили!\nТеперь выбери точку:",
+                text="✅ Тебя одобрили!\nТеперь выбери точку (можно менять в любой момент, когда смена закрыта):",
                 reply_markup=after_approved_kb(),
             )
         except Exception as e:
