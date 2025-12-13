@@ -464,6 +464,25 @@ def list_active_users_by_point(point: str) -> List[UserRec]:
     return out
 
 
+def list_active_users_all() -> List[UserRec]:
+    """Все активные сотрудники (независимо от выбранной точки)."""
+    rows, has_header = _users_rows()
+    if not rows:
+        return []
+    start = 1 if has_header else 0
+    out: List[UserRec] = []
+    for r in rows[start:]:
+        if len(r) < 4:
+            continue
+        try:
+            u = parse_user(r)
+        except Exception:
+            continue
+        if u.status == STATUS_ACTIVE:
+            out.append(u)
+    return out
+
+
 # -------------------- TASKS / SCHEDULE --------------------
 
 
@@ -748,7 +767,7 @@ def shift_kb(role: str, point: str) -> InlineKeyboardMarkup:
     ]
     if role == "HALF1":
         rows.append([InlineKeyboardButton("🔁 Передать смену", callback_data="TRANSFER")])
-    if role in ("FULL", "HALF2") and can_close_now(point):
+    if role in ("FULL", "HALF2"):
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE")])
     return InlineKeyboardMarkup(rows)
 
@@ -1666,7 +1685,7 @@ async def transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     point = normalize_point(sess.point)
 
     # список активных сотрудников на этой точке
-    users = [x for x in list_active_users_by_point(point) if x.user_id != u.user_id]
+    users = [x for x in list_active_users_all() if x.user_id != u.user_id]
     if not users:
         await q.edit_message_text(
             "Нет активных сотрудников на этой точке для передачи.\n"
@@ -1710,10 +1729,6 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Этот сотрудник сейчас не активен.", reply_markup=shift_kb(role, point))
         return
 
-    if normalize_point(u2.point) != point:
-        await q.edit_message_text("Сотрудник должен выбрать ту же точку, что и ты.", reply_markup=shift_kb(role, point))
-        return
-
     # проверка косяков по задачам первой половины
     tasks_all = load_tasks_for_today(point)
     split_index = int(sess.split_index or "0")
@@ -1748,7 +1763,8 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=u2.user_id,
-            text=f"Тебе передают смену на точке: {point}\nНажми «Принять смену».",
+            text=f"Тебе передают смену на точке: {point}
+Нажми «Принять смену». (Точку выбирать не нужно)",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{sess.session_id}")]]),
         )
     except Exception as e:
@@ -1803,9 +1819,10 @@ async def accept_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sess.user2_id != str(u.user_id):
         await q.edit_message_text("Эта смена адресована другому сотруднику.")
         return
-    if normalize_point(u.point) != normalize_point(sess.point):
-        await q.edit_message_text("У тебя должна быть выбрана та же точка. Нажми /start и выбери точку.")
-        return
+
+
+    # Автоматически привязываем сотрудника ко входящей точке смены
+    set_user_point(u.user_id, normalize_point(sess.point))
 
     ts = now_tz().isoformat(timespec="seconds")
     sess.state = "OPEN2"
@@ -1849,11 +1866,6 @@ async def close_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if role not in ("FULL", "HALF2"):
         await q.edit_message_text("Закрытие смены доступно только для полной смены или второго сотрудника пол-смены.")
-        return ConversationHandler.END
-
-    if not can_close_now(point):
-        _s, end = point_hours(point)
-        await q.edit_message_text(f"Кнопка «Закрыть смену» появится в конце смены (в {end.strftime('%H:%M')}).", reply_markup=shift_kb(role, point))
         return ConversationHandler.END
 
     # подготовим контекст закрытия
