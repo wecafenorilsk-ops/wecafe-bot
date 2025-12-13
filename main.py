@@ -2040,11 +2040,11 @@ async def close_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Лично претензий к тебе нет, но косячек с тебя снял! Руководитель будет крайне не доволен!😌\n"
             "Задания на сегодня тобою не выполнены.\n\n"
-            "Смена закрыта ✅",
-            reply_markup=open_choice_kb(),
+            "Смена закрыта ✅\n\nВыбери точку:",
+            reply_markup=after_approved_kb(),
         )
     else:
-        await update.message.reply_text("Смена закрыта ✅", reply_markup=open_choice_kb())
+        await update.message.reply_text("Смена закрыта ✅\n\nВыбери точку:", reply_markup=after_approved_kb())
 
     # отчет в контроль (с цифрами)
     summary = (
