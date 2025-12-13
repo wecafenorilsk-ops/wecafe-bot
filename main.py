@@ -886,7 +886,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not u.point:
             await update.message.reply_text(text + "\n\nВыбери точку:", reply_markup=after_approved_kb())
         else:
-            await update.message.reply_text(text + f"\n\nТвоя точка: {normalize_point(u.point)}\nЧто делаем?", reply_markup=open_choice_kb())
+            await update.message.reply_text(text + f"\n\nТвоя точка сейчас: {normalize_point(u.point)}\nНажми «Сменить точку» (можно выбрать ту же) и потом открой смену.", reply_markup=after_approved_kb())
         return ConversationHandler.END
 
     # новая регистрация
