@@ -2,21 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-WeCafe Cleaning Bot (Telegram) — адаптирован под твою таблицу
+WeCafe Shift & Tasks Bot (Telegram) — версия под сценарий DreamTeam
 
-Твои листы:
-- cleaning_schedule  (план задач: task_id, task_name, point, photo_required, D1..D31)
-- users             (пользователи бота)
-- points            (список точек)
-- shift_totals      (оставляем как есть — бот туда НЕ пишет)
-- config / README   (бот не трогает)
+Основано на текущем работающем боте и его подходе к Google Sheets (users/points/cleaning_schedule + лог-листы). fileciteturn0file0
 
-Бот создаёт только 2 новых листа, если их нет:
-- done_log          (что отметили выполненным)
-- shift_log         (открытие/закрытие смены)
+Сценарий:
+- регистрация: Имя -> код DreamTeam -> запрос на одобрение в группу контроля
+- после одобрения: только выбор точки -> затем только 2 кнопки открытия смены (полная/пол смены)
+- полная смена: фото готовности витрины при открытии; план задач на день; отметка задач с 1-2 фото; напоминания раз в час при бездействии; закрытие только в конце смены с цифрами + 2 фото чеков + 4 фото уборки
+- пол смены: задачи делятся пополам; у 1-го есть кнопка передачи смены конкретному 2-му сотруднику на этой точке; закрытие смены (чеки/цифры/уборка) только у 2-го
+- “Красавчик помоги”: сообщение + до 4 фото в контроль
+- админ в группе контроля может блокировать/разблокировать сотрудника
 
-ВАЖНО:
-- Google JSON-ключ НЕ лежит рядом с кодом. Он берётся из переменной окружения.
+Деплой:
+- Render / Webhook или Polling (как в текущем коде)
+- Google JSON ключ: GOOGLE_SHEETS_CREDENTIALS_FILE или GOOGLE_SHEETS_CREDENTIALS_JSON_B64 (base64)
 """
 
 from __future__ import annotations
@@ -27,9 +27,9 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date, time, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import pytz
 from aiohttp import web
@@ -37,7 +37,13 @@ from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -55,54 +61,54 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 
-# Лучше: путь к json
 GOOGLE_SHEETS_CREDENTIALS_FILE = os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "").strip()
-# На крайний случай: base64 от json
 GOOGLE_SHEETS_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON_B64", "").strip()
 
-TIME_ZONE = os.getenv("TIME_ZONE", "Europe/Moscow").strip()
-
-ENABLE_HEALTH = os.getenv("ENABLE_HEALTH", "1").strip() != "0"
-HEALTH_HOST = os.getenv("HEALTH_HOST", "127.0.0.1").strip()
-HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080").strip() or "8080")
+# Часовой пояс по ТЗ: Красноярский край
+TIME_ZONE = os.getenv("TIME_ZONE", "Asia/Krasnoyarsk").strip()
 
 CONTROL_GROUP_ID = int(os.getenv("CONTROL_GROUP_ID", "0").strip() or "0")
 REPORT_TO_CONTROL = os.getenv("REPORT_TO_CONTROL", "1").strip() != "0"
+
+ACCESS_CODE = os.getenv("ACCESS_CODE", "DreamTeam").strip()
 
 # Webhook (Render)
 WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip() == "1"
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook").strip().lstrip("/")
 
-# Напоминания по уборке
-ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "1").strip() != "0"
-REMINDER_INTERVAL_MINUTES = int(os.getenv("REMINDER_INTERVAL_MINUTES", "30").strip() or "30")
+# Health
+ENABLE_HEALTH = os.getenv("ENABLE_HEALTH", "1").strip() != "0"
+HEALTH_HOST = os.getenv("HEALTH_HOST", "127.0.0.1").strip()
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080").strip() or "8080")
 
-# Имена листов как на твоём файле
+# Напоминания
+ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "1").strip() != "0"
+REMINDER_CHECK_MINUTES = int(os.getenv("REMINDER_CHECK_MINUTES", "10").strip() or "10")  # проверяем чаще, пинаем раз в час
+REMINDER_IDLE_MINUTES = int(os.getenv("REMINDER_IDLE_MINUTES", "60").strip() or "60")
+
+# Листы (сохраняем “дух” текущего бота)
 SHEET_SCHEDULE = os.getenv("SHEET_SCHEDULE", "cleaning_schedule").strip()
 SHEET_USERS = os.getenv("SHEET_USERS", "users").strip()
 SHEET_POINTS = os.getenv("SHEET_POINTS", "points").strip()
-SHEET_DONE = os.getenv("SHEET_DONE", "done_log").strip()
-SHEET_SHIFT = os.getenv("SHEET_SHIFT", "shift_log").strip()
 
-# Заголовки (если лист пустой, бот добавит)
-USERS_HEADER = ["user_id", "name", "point", "status", "created_at", "updated_at"]
-DONE_HEADER = ["timestamp", "day", "user_id", "point", "task_id", "task_name", "photo_required", "photo_file_id"]
-SHIFT_HEADER = ["timestamp", "day", "user_id", "point", "action"]
+# Логи и служебные
+SHEET_DONE = os.getenv("SHEET_DONE", "done_log").strip()                # отметки задач
+SHEET_SESSIONS = os.getenv("SHEET_SESSIONS", "shift_sessions").strip()  # состояния смен
+SHEET_CLOSE = os.getenv("SHEET_CLOSE", "close_log").strip()             # закрытие смены (цифры + фото)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Conversation states
-GET_NAME, GET_POINT = range(2)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("wecafe-bot")
+log = logging.getLogger("wecafe-shift-bot")
 
-# -------------------- HELPERS --------------------
+# -------------------- TIME HELPERS --------------------
+
+_tz = pytz.timezone(TIME_ZONE)
 
 
 def now_tz() -> datetime:
-    return datetime.now(pytz.timezone(TIME_ZONE))
+    return datetime.now(_tz)
 
 
 def day_key() -> str:
@@ -110,12 +116,14 @@ def day_key() -> str:
 
 
 def day_column_name() -> str:
-    # В твоей таблице колонки называются D1, D2, ... D31
+    # в cleaning_schedule: D1..D31
     return f"D{now_tz().day}"
 
 
+# -------------------- SANITIZE --------------------
+
+
 def sanitize_for_sheets(text: str) -> str:
-    # защита от формул (= + - @)
     if not isinstance(text, str):
         text = str(text)
     text = text.strip()
@@ -127,8 +135,10 @@ def sanitize_for_sheets(text: str) -> str:
 def normalize_name(name: str) -> str:
     name = (name or "").strip()
     name = " ".join(name.split())
-    name = name[:32]
-    return sanitize_for_sheets(name)
+    return sanitize_for_sheets(name[:32])
+
+
+# -------------------- ENV CHECK --------------------
 
 
 def require_env():
@@ -139,17 +149,16 @@ def require_env():
         problems.append("SPREADSHEET_ID пустой")
     if not (GOOGLE_SHEETS_CREDENTIALS_FILE or GOOGLE_SHEETS_CREDENTIALS_JSON_B64):
         problems.append("нужен GOOGLE_SHEETS_CREDENTIALS_FILE или GOOGLE_SHEETS_CREDENTIALS_JSON_B64")
+    if CONTROL_GROUP_ID == 0:
+        problems.append("CONTROL_GROUP_ID не задан (нужен для одобрения/отчетов)")
     if problems:
         raise RuntimeError("Проблемы с настройкой ENV: " + "; ".join(problems))
 
 
-def format_control(
-    title: str,
-    user_name: str,
-    user_id: int,
-    point: str = "",
-    details: Optional[List[str]] = None,
-) -> str:
+# -------------------- CONTROL GROUP REPORT --------------------
+
+
+def format_control(title: str, user_name: str, user_id: int, point: str = "", details: Optional[List[str]] = None) -> str:
     lines = [title, f"Сотрудник: {user_name} ({user_id})"]
     if point:
         lines.append(f"Точка: {point}")
@@ -158,27 +167,25 @@ def format_control(
     return "\n".join(lines)
 
 
-async def report_to_control(
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-    photo_file_id: Optional[str] = None,
-    caption: str = "",
-):
-    """Отправляет сообщение (и опционально фото) в группу контроля. Ошибки глотаем, чтобы не ломать бизнес-логику."""
+async def report_to_control(context: ContextTypes.DEFAULT_TYPE, text: str):
     if not REPORT_TO_CONTROL or CONTROL_GROUP_ID == 0:
         return
     try:
         await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
     except Exception as e:
         log.warning("Не смог отправить сообщение в контроль: %s", e)
-    if photo_file_id:
-        try:
-            await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=photo_file_id, caption=caption)
-        except Exception as e:
-            log.warning("Не смог отправить фото в контроль: %s", e)
 
 
-# -------------------- GOOGLE SHEETS API --------------------
+async def report_photo_to_control(context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: str = ""):
+    if not REPORT_TO_CONTROL or CONTROL_GROUP_ID == 0:
+        return
+    try:
+        await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=file_id, caption=caption)
+    except Exception as e:
+        log.warning("Не смог отправить фото в контроль: %s", e)
+
+
+# -------------------- GOOGLE SHEETS --------------------
 
 _svc = None
 
@@ -256,65 +263,145 @@ def is_header(row: List[str], must_include: str) -> bool:
     return must_include.lower() in low
 
 
-# -------------------- DATA: POINTS --------------------
+# -------------------- SCHEMAS --------------------
+# users: сохраняем совместимость с текущим: user_id, name, point, status, created_at, updated_at
+# status: "На одобрении" | "Активен" | "Заблокирован"
+USERS_HEADER = ["user_id", "name", "point", "status", "created_at", "updated_at"]
+
+# done_log: расширяем (не ломая): timestamp, day, point, user_id, user_name, task_id, task_name, part, photo1, photo2
+DONE_HEADER = ["timestamp", "day", "point", "user_id", "user_name", "task_id", "task_name", "part", "photo1_file_id", "photo2_file_id"]
+
+# shift_sessions: единая запись на точку/день
+# session_id, day, point, mode(FULL|HALF), state, user1_id, user1_name, user1_start, user1_end,
+# user2_id, user2_name, user2_start, user2_end, split_index, updated_at
+SESSIONS_HEADER = [
+    "session_id", "day", "point", "mode", "state",
+    "user1_id", "user1_name", "user1_start", "user1_end",
+    "user2_id", "user2_name", "user2_start", "user2_end",
+    "split_index", "updated_at",
+]
+
+# close_log: фиксация закрытия смены
+CLOSE_HEADER = [
+    "timestamp", "day", "point", "session_id", "mode",
+    "user_id", "user_name",
+    "cash_in", "sales_cashless", "sales_cash", "refunds",
+    "total_sales", "cash_in_box",
+    "receipt1_file_id", "receipt2_file_id",
+    "cleanup1_file_id", "cleanup2_file_id", "cleanup3_file_id", "cleanup4_file_id",
+    "note",
+]
+
+# -------------------- BOOTSTRAP SHEETS --------------------
+
+
+def ensure_sheets():
+    ensure_sheet_exists(SHEET_USERS)
+    ensure_sheet_exists(SHEET_POINTS)
+    ensure_sheet_exists(SHEET_SCHEDULE)
+    ensure_sheet_exists(SHEET_DONE)
+    ensure_sheet_exists(SHEET_SESSIONS)
+    ensure_sheet_exists(SHEET_CLOSE)
+
+    ensure_header(SHEET_USERS, USERS_HEADER)
+    ensure_header(SHEET_DONE, DONE_HEADER)
+    ensure_header(SHEET_SESSIONS, SESSIONS_HEADER)
+    ensure_header(SHEET_CLOSE, CLOSE_HEADER)
+
+
+# -------------------- POINTS --------------------
+
+
+DEFAULT_POINTS = ["69 Параллель", "Арена", "Музей", "Сочнева"]
 
 
 def load_points() -> List[str]:
     rows = sheet_get(SHEET_POINTS)
     if not rows:
-        return ["69 Параллель", "Арена", "Кафе Музей"]
-
+        return DEFAULT_POINTS
     start = 1 if is_header(rows[0], "point") else 0
     pts: List[str] = []
     for r in rows[start:]:
         if r and r[0].strip():
             pts.append(r[0].strip())
-    return pts or ["69 Параллель", "Арена", "Кафе Музей"]
+    return pts or DEFAULT_POINTS
 
 
-# -------------------- DATA: USERS --------------------
+def normalize_point(point: str) -> str:
+    p = (point or "").strip()
+    # мягкая нормализация под варианты из старой таблицы
+    if "музей" in p.lower():
+        return "Музей"
+    if "сочнев" in p.lower():
+        return "Сочнева"
+    if "арена" in p.lower():
+        return "Арена"
+    if "69" in p or "паралл" in p.lower():
+        return "69 Параллель"
+    return p
+
+
+# -------------------- USERS --------------------
+
+
+@dataclass
+class UserRec:
+    user_id: int
+    name: str
+    point: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
+STATUS_PENDING = "На одобрении"
+STATUS_ACTIVE = "Активен"
+STATUS_BLOCKED = "Заблокирован"
+
+
+def _users_rows() -> Tuple[List[List[str]], bool]:
+    rows = sheet_get(SHEET_USERS)
+    if not rows:
+        return [], False
+    has_header = is_header(rows[0], "user_id")
+    return rows, has_header
 
 
 def get_user_row_and_index(user_id: int) -> Tuple[Optional[List[str]], Optional[int], bool]:
-    rows = sheet_get(SHEET_USERS)
+    rows, has_header = _users_rows()
     if not rows:
-        return None, None, False
-
-    has_header = is_header(rows[0], "user_id")
+        return None, None, has_header
     start = 1 if has_header else 0
-
     for i, row in enumerate(rows[start:], start=1 + start):
         if len(row) >= 1 and row[0] == str(user_id):
             return row, i, has_header
-        if len(row) >= 2 and row[1] == str(user_id):  # поддержка старых форматов
-            return row, i, has_header
-
     return None, None, has_header
 
 
-def is_user_active(user_id: int) -> bool:
-    row, _, _ = get_user_row_and_index(user_id)
-    if not row:
-        return False
-    if len(row) >= 4 and row[0] == str(user_id):
-        return row[3] == "Активен"
-    if len(row) >= 4:
-        return row[3] == "Активен"
-    return False
+def parse_user(row: List[str]) -> UserRec:
+    # ожидаем порядок как USERS_HEADER
+    uid = int(row[0])
+    name = row[1] if len(row) > 1 else ""
+    point = row[2] if len(row) > 2 else ""
+    status = row[3] if len(row) > 3 else STATUS_PENDING
+    created_at = row[4] if len(row) > 4 else ""
+    updated_at = row[5] if len(row) > 5 else ""
+    return UserRec(uid, name, point, status, created_at, updated_at)
 
 
-def get_user_point(user_id: int) -> Optional[str]:
+def get_user(user_id: int) -> Optional[UserRec]:
     row, _, _ = get_user_row_and_index(user_id)
     if not row:
         return None
-    if len(row) >= 3 and row[0] == str(user_id):
-        return row[2]
-    return None
+    try:
+        return parse_user(row)
+    except Exception:
+        return None
 
 
-def upsert_user(user_id: int, name: str, point: str, status: str = "Активен"):
+def upsert_user(user_id: int, name: str, point: str = "", status: str = STATUS_PENDING):
     name = normalize_name(name)
-    point = sanitize_for_sheets(point)
+    point = sanitize_for_sheets(normalize_point(point))
     ts = now_tz().isoformat(timespec="seconds")
 
     row, idx, _ = get_user_row_and_index(user_id)
@@ -327,19 +414,57 @@ def upsert_user(user_id: int, name: str, point: str, status: str = "Активе
     sheet_update(f"{SHEET_USERS}!A{idx}:F{idx}", new_row)
 
 
-def set_user_point(user_id: int, point: str):
-    row, idx, _ = get_user_row_and_index(user_id)
-    if row is None or idx is None:
+def set_user_status(user_id: int, status: str):
+    u = get_user(user_id)
+    if not u:
         return
-    ts = now_tz().isoformat(timespec="seconds")
-    name = row[1] if len(row) >= 2 else ""
-    status = row[3] if len(row) >= 4 else "Активен"
-    created_at = row[4] if len(row) >= 5 else ts
-    new_row = [str(user_id), name, sanitize_for_sheets(point), status, created_at, ts]
-    sheet_update(f"{SHEET_USERS}!A{idx}:F{idx}", new_row)
+    upsert_user(user_id, u.name, u.point, status=status)
 
 
-# -------------------- DATA: SCHEDULE --------------------
+def set_user_point(user_id: int, point: str):
+    u = get_user(user_id)
+    if not u:
+        return
+    upsert_user(user_id, u.name, point, status=u.status)
+
+
+def is_user_active(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u and u.status == STATUS_ACTIVE)
+
+
+def is_user_blocked(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u and u.status == STATUS_BLOCKED)
+
+
+def is_user_pending(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u and u.status == STATUS_PENDING)
+
+
+def list_active_users_by_point(point: str) -> List[UserRec]:
+    rows, has_header = _users_rows()
+    if not rows:
+        return []
+    start = 1 if has_header else 0
+    out: List[UserRec] = []
+    for r in rows[start:]:
+        if len(r) < 4:
+            continue
+        try:
+            u = parse_user(r)
+        except Exception:
+            continue
+        if u.status != STATUS_ACTIVE:
+            continue
+        if normalize_point(u.point) != normalize_point(point):
+            continue
+        out.append(u)
+    return out
+
+
+# -------------------- TASKS / SCHEDULE --------------------
 
 
 @dataclass
@@ -347,7 +472,6 @@ class Task:
     task_id: str
     task_name: str
     point: str
-    photo_required: bool
 
 
 def _truthy(x: str) -> bool:
@@ -358,757 +482,1663 @@ def _truthy(x: str) -> bool:
 def load_tasks_for_today(point_selected: str) -> List[Task]:
     """
     Берём из cleaning_schedule задачи, у которых:
-    - в колонке D{сегодняшний день} стоит 1/TRUE
+    - в колонке D{сегодня} стоит 1/TRUE
     - point == выбранная точка ИЛИ point == ALL
     """
     rows = sheet_get(SHEET_SCHEDULE)
     if not rows:
         return []
-
     header = rows[0]
     col = day_column_name()
     try:
         day_idx = header.index(col)
     except ValueError:
         return []
-
     tasks: List[Task] = []
     for r in rows[1:]:
-        if len(r) <= max(3, day_idx):
+        if len(r) <= max(2, day_idx):
             continue
-        task_id = r[0].strip() if len(r) > 0 else ""
-        task_name = r[1].strip() if len(r) > 1 else ""
-        p = r[2].strip() if len(r) > 2 else ""
-        photo_req = _truthy(r[3]) if len(r) > 3 else False
+        task_id = (r[0] or "").strip() if len(r) > 0 else ""
+        task_name = (r[1] or "").strip() if len(r) > 1 else ""
+        p = (r[2] or "").strip() if len(r) > 2 else ""
         flag = r[day_idx] if len(r) > day_idx else "0"
-
         if not task_id or not task_name:
             continue
         if not _truthy(flag):
             continue
-
-        if p == "ALL" or p == point_selected:
-            tasks.append(Task(task_id=task_id, task_name=task_name, point=p, photo_required=photo_req))
-
+        if p == "ALL" or normalize_point(p) == normalize_point(point_selected):
+            tasks.append(Task(task_id=task_id, task_name=task_name, point=p))
     return tasks
 
 
-# -------------------- LOGS --------------------
+def split_tasks_half(tasks: List[Task]) -> Tuple[List[Task], List[Task], int]:
+    """Делим пополам стабильно по порядку. Возвращаем (part1, part2, split_index)."""
+    n = len(tasks)
+    split_index = (n + 1) // 2
+    return tasks[:split_index], tasks[split_index:], split_index
 
 
-def ensure_logs():
-    ensure_sheet_exists(SHEET_DONE)
-    ensure_sheet_exists(SHEET_SHIFT)
-    ensure_header(SHEET_USERS, USERS_HEADER)
-    ensure_header(SHEET_DONE, DONE_HEADER)
-    ensure_header(SHEET_SHIFT, SHIFT_HEADER)
+# -------------------- DONE LOG --------------------
 
 
-def log_done(user_id: int, point: str, task: Task, photo_file_id: str = ""):
+def log_done(day: str, point: str, user: UserRec, task: Task, part: str, photo1: str, photo2: str):
     ts = now_tz().isoformat(timespec="seconds")
     sheet_append(
         SHEET_DONE,
         [
             ts,
-            day_key(),
-            str(user_id),
-            sanitize_for_sheets(point),
+            day,
+            sanitize_for_sheets(normalize_point(point)),
+            str(user.user_id),
+            sanitize_for_sheets(user.name),
             sanitize_for_sheets(task.task_id),
             sanitize_for_sheets(task.task_name),
-            "TRUE" if task.photo_required else "FALSE",
-            photo_file_id,
+            sanitize_for_sheets(part),
+            photo1,
+            photo2,
         ],
     )
 
 
-def log_shift(user_id: int, point: str, action: str):
-    ts = now_tz().isoformat(timespec="seconds")
-    sheet_append(SHEET_SHIFT, [ts, day_key(), str(user_id), sanitize_for_sheets(point), sanitize_for_sheets(action)])
-
-
-def get_done_task_ids_for_today(point: str, user_id: int) -> set[str]:
-    """Возвращает множества task_id, которые этот пользователь уже закрыл сегодня на точке."""
+def get_done_task_ids(day: str, point: str) -> set[str]:
+    """Глобально на точке/день: какие task_id уже закрыты (независимо от сотрудника)."""
     try:
-        rows = sheet_get(f"{SHEET_DONE}!A2:H")
+        rows = sheet_get(f"{SHEET_DONE}!A2:J")
     except Exception:
         return set()
-
-    today = day_key()
-    uid = str(user_id)
-    result: set[str] = set()
-
+    out: set[str] = set()
+    p = normalize_point(point)
     for r in rows:
-        if len(r) < 6:
+        if len(r) < 7:
             continue
-        day_val = r[1]
-        uid_val = r[2]
-        point_val = r[3]
-        task_id_val = r[4]
-        if day_val != today:
+        if r[1] != day:
             continue
-        if uid_val != uid:
+        if normalize_point(r[2]) != p:
             continue
-        if point_val != point:
-            continue
-        if not task_id_val:
-            continue
-        result.add(task_id_val)
-
-    return result
+        tid = r[5] if len(r) > 5 else ""
+        if tid:
+            out.add(tid)
+    return out
 
 
-def get_last_shift_state(user_id: int) -> tuple[bool, str]:
-    """Возвращает (has_open_shift, last_point) по последней записи в shift_log."""
+def last_task_action_ts(day: str, point: str, user_id: int) -> Optional[datetime]:
+    """Последняя отметка задачи этим пользователем на точке/день."""
     try:
-        rows = sheet_get(f"{SHEET_SHIFT}!A2:E")
+        rows = sheet_get(f"{SHEET_DONE}!A2:J")
     except Exception:
-        return False, ""
-    last_point = ""
-    last_action = ""
+        return None
+    p = normalize_point(point)
+    last: Optional[datetime] = None
     uid = str(user_id)
     for r in rows:
-        if len(r) < 5:
-            continue
-        if r[2] != uid:
-            continue
-        last_point = r[3]
-        last_action = r[4]
-    return (last_action == "OPEN_SHIFT"), last_point
-
-
-# -------------------- REMINDERS --------------------
-
-
-def load_active_users() -> List[Tuple[int, str, str]]:
-    """Активные пользователи из листа users: (user_id, name, point)."""
-    rows = sheet_get(SHEET_USERS)
-    if not rows:
-        return []
-    start = 1 if is_header(rows[0], "user_id") else 0
-    out: List[Tuple[int, str, str]] = []
-    for r in rows[start:]:
         if len(r) < 4:
             continue
-        uid_raw = (r[0] or "").strip()
-        status = (r[3] or "").strip()
-        if status != "Активен":
+        if r[1] != day:
+            continue
+        if normalize_point(r[2]) != p:
+            continue
+        if r[3] != uid:
             continue
         try:
-            uid = int(uid_raw)
+            ts = datetime.fromisoformat(r[0])
         except Exception:
             continue
-        name = (r[1] if len(r) > 1 else "") or ""
-        point = (r[2] if len(r) > 2 else "") or ""
-        out.append((uid, name, point))
-    return out
+        if (last is None) or (ts > last):
+            last = ts
+    return last
 
 
-def get_open_shifts_map() -> Dict[int, str]:
-    """Карта открытых смен: user_id -> point (по последнему действию в shift_log)."""
-    try:
-        rows = sheet_get(f"{SHEET_SHIFT}!A2:E")
-    except Exception:
-        return {}
-    state: Dict[int, str] = {}
-    for r in rows:
-        if len(r) < 5:
-            continue
-        try:
-            uid = int(r[2])
-        except Exception:
-            continue
-        point = r[3] if len(r) > 3 else ""
-        action = r[4] if len(r) > 4 else ""
-        if action == "OPEN_SHIFT":
-            state[uid] = point
-        elif action == "CLOSE_SHIFT":
-            state.pop(uid, None)
-    return state
+# -------------------- SHIFT SESSIONS --------------------
 
 
-def get_done_ids_map_for_today(today: str) -> Dict[Tuple[int, str], set[str]]:
-    """Карта отмеченных задач за сегодня: (user_id, point) -> set(task_id)."""
-    try:
-        rows = sheet_get(f"{SHEET_DONE}!A2:H")
-    except Exception:
-        return {}
-    out: Dict[Tuple[int, str], set[str]] = {}
-    for r in rows:
-        if len(r) < 6:
-            continue
-        day_val = r[1]
-        if day_val != today:
-            continue
-        try:
-            uid = int(r[2])
-        except Exception:
-            continue
-        point = r[3]
-        task_id = r[4]
-        if not point or not task_id:
-            continue
-        out.setdefault((uid, point), set()).add(task_id)
-    return out
+@dataclass
+class Session:
+    session_id: str
+    day: str
+    point: str
+    mode: str  # FULL | HALF
+    state: str  # OPEN_FULL | OPEN1 | WAIT_ACCEPT | OPEN2 | CLOSED
+    user1_id: str
+    user1_name: str
+    user1_start: str
+    user1_end: str
+    user2_id: str
+    user2_name: str
+    user2_start: str
+    user2_end: str
+    split_index: str
+    updated_at: str
 
 
-async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
-    """Раз в N минут пинаем сотрудников с открытой сменой, если есть невыполненные задачи уборки."""
-    if not ENABLE_REMINDERS:
-        return
-
-    today = day_key()
-    active_users = load_active_users()
-    if not active_users:
-        return
-
-    open_map = get_open_shifts_map()
-    if not open_map:
-        return
-
-    done_map = get_done_ids_map_for_today(today)
-
-    for uid, name, _default_point in active_users:
-        point = open_map.get(uid)
-        if not point:
-            continue
-
-        tasks = load_tasks_for_today(point)
-        if not tasks:
-            continue
-
-        done_ids = done_map.get((uid, point), set())
-        remaining = [t for t in tasks if t.task_id not in done_ids]
-        if not remaining:
-            continue
-
-        lines = [f"⏰ Напоминание: по уборке осталось задач: {len(remaining)}"]
-        for t in remaining[:7]:
-            photo_icon = " 📸" if t.photo_required else ""
-            lines.append(f"• {t.task_name}{photo_icon}")
-        if len(remaining) > 7:
-            lines.append("…")
-        lines.append("\nОткрой меню: /menu")
-        try:
-            await context.bot.send_message(chat_id=uid, text="\n".join(lines))
-        except Exception as e:
-            log.warning("Не смог отправить напоминание пользователю %s: %s", uid, e)
+def make_session_id(day: str, point: str) -> str:
+    return f"{day}|{normalize_point(point)}"
 
 
-# -------------------- UI --------------------
+def _sessions_rows() -> Tuple[List[List[str]], bool]:
+    rows = sheet_get(SHEET_SESSIONS)
+    if not rows:
+        return [], False
+    has_header = is_header(rows[0], "session_id")
+    return rows, has_header
 
 
-def main_menu(user_id: int) -> InlineKeyboardMarkup:
-    has_open, _last_point = get_last_shift_state(user_id)
+def get_session(day: str, point: str) -> Tuple[Optional[Session], Optional[int]]:
+    rows, has_header = _sessions_rows()
+    if not rows:
+        return None, None
+    start = 1 if has_header else 0
+    sid = make_session_id(day, point)
+    for i, r in enumerate(rows[start:], start=1 + start):
+        if r and r[0] == sid:
+            # pad to header length
+            while len(r) < len(SESSIONS_HEADER):
+                r.append("")
+            try:
+                return Session(*r[:len(SESSIONS_HEADER)]), i
+            except Exception:
+                return None, None
+    return None, None
 
-    rows: List[List[InlineKeyboardButton]] = []
-    if not has_open:
-        rows.append([InlineKeyboardButton("📍 Выбор точки", callback_data="CHOOSE_POINT")])
 
-    rows.append([InlineKeyboardButton("🧾 Посмотреть план уборки", callback_data="VIEW_PLAN")])
-    rows.append([InlineKeyboardButton("✅ Отметить выполненное", callback_data="MARK_DONE")])
-    rows.append([InlineKeyboardButton("📸 Отправить фото для отметки", callback_data="HELP_PHOTO")])
-
-    if has_open:
-        rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE_SHIFT")])
+def upsert_session(sess: Session):
+    ts = now_tz().isoformat(timespec="seconds")
+    sess.updated_at = ts
+    existing, idx = get_session(sess.day, sess.point)
+    row = list(sess.__dict__.values())
+    if existing is None or idx is None:
+        sheet_append(SHEET_SESSIONS, row)
     else:
-        rows.append([InlineKeyboardButton("🔓 Открыть смену", callback_data="OPEN_SHIFT")])
+        sheet_update(f"{SHEET_SESSIONS}!A{idx}:O{idx}", row)
 
+
+def list_open_sessions() -> List[Session]:
+    rows, has_header = _sessions_rows()
+    if not rows:
+        return []
+    start = 1 if has_header else 0
+    out: List[Session] = []
+    for r in rows[start:]:
+        if not r:
+            continue
+        while len(r) < len(SESSIONS_HEADER):
+            r.append("")
+        try:
+            s = Session(*r[:len(SESSIONS_HEADER)])
+        except Exception:
+            continue
+        if s.state and s.state != "CLOSED":
+            out.append(s)
+    return out
+
+
+def user_open_context(user_id: int) -> Tuple[Optional[Session], Optional[str]]:
+    """Возвращает (session, role) где role: 'FULL', 'HALF1', 'HALF2'."""
+    d = day_key()
+    sessions = list_open_sessions()
+    for s in sessions:
+        if s.day != d:
+            continue
+        if s.mode == "FULL" and s.state == "OPEN_FULL" and s.user1_id == str(user_id):
+            return s, "FULL"
+        if s.mode == "HALF":
+            if s.state == "OPEN1" and s.user1_id == str(user_id):
+                return s, "HALF1"
+            if s.state == "OPEN2" and s.user2_id == str(user_id):
+                return s, "HALF2"
+    return None, None
+
+
+# -------------------- WORK HOURS / CLOSE BUTTON --------------------
+
+
+WORK_HOURS = {
+    "69 Параллель": (time(10, 0), time(22, 0)),
+    "Арена": (time(10, 0), time(22, 0)),
+    "Музей": (time(9, 0), time(19, 0)),
+    "Сочнева": (time(14, 0), time(23, 0)),
+}
+
+
+def point_hours(point: str) -> Tuple[time, time]:
+    p = normalize_point(point)
+    return WORK_HOURS.get(p, (time(10, 0), time(22, 0)))
+
+
+def can_close_now(point: str) -> bool:
+    _start, end = point_hours(point)
+    now = now_tz().time()
+    return now >= end
+
+
+def in_work_hours(point: str) -> bool:
+    start, end = point_hours(point)
+    now = now_tz().time()
+    return start <= now <= end
+
+
+# -------------------- UI BUILDERS --------------------
+
+
+def kb_single(label: str, cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cb)]])
+
+
+def points_kb(points: List[str], prefix: str = "POINT") -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(p, callback_data=f"{prefix}|{i}")] for i, p in enumerate(points)]
     return InlineKeyboardMarkup(rows)
 
 
-def points_keyboard(points: List[str], prefix: str) -> InlineKeyboardMarkup:
-    btns = [[InlineKeyboardButton(p, callback_data=f"{prefix}|{i}")] for i, p in enumerate(points)]
-    btns.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_MENU")])
-    return InlineKeyboardMarkup(btns)
+def after_approved_kb() -> InlineKeyboardMarkup:
+    return kb_single("📍 Выбор точки", "CHOOSE_POINT")
 
 
-def tasks_keyboard(tasks: List[Task]) -> InlineKeyboardMarkup:
-    btns: List[List[InlineKeyboardButton]] = []
+def open_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔓 Открыть смену (полная)", callback_data="OPEN|FULL")],
+        [InlineKeyboardButton("⏱️ Открыть пол смены", callback_data="OPEN|HALF")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK_TO_POINT")],
+    ])
+
+
+def shift_kb(role: str, point: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🧾 План задач", callback_data="PLAN")],
+        [InlineKeyboardButton("✅ Отметить выполненную задачу", callback_data="MARK")],
+        [InlineKeyboardButton("🤝 Красавчик помоги", callback_data="HELP")],
+    ]
+    if role == "HALF1":
+        rows.append([InlineKeyboardButton("🔁 Передать смену", callback_data="TRANSFER")])
+    if role in ("FULL", "HALF2") and can_close_now(point):
+        rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_MAIN")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tasks_kb(tasks: List[Task], done_ids: set[str]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
     for i, t in enumerate(tasks):
-        icon = "📸 " if t.photo_required else ""
-        label = f"{icon}{t.task_name}"
+        status = "✅" if t.task_id in done_ids else "⬜"
+        label = f"{status} {t.task_name}"
         if len(label) > 48:
             label = label[:45] + "…"
-        btns.append([InlineKeyboardButton(f"✅ {label}", callback_data=f"DONE|{i}")])
-    btns.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_MENU")])
-    return InlineKeyboardMarkup(btns)
+        rows.append([InlineKeyboardButton(label, callback_data=f"TASK|{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_SHIFT")])
+    return InlineKeyboardMarkup(rows)
 
 
-# -------------------- HANDLERS --------------------
+def approve_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"ADM|APPROVE|{user_id}"),
+            InlineKeyboardButton("⛔️ Блок", callback_data=f"ADM|BLOCK|{user_id}"),
+        ]
+    ])
 
 
-def current_point(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
-    p = context.user_data.get("point")
-    if p:
-        return p
-    p = get_user_point(user_id)
-    if p:
-        context.user_data["point"] = p
-        return p
-    pts = load_points()
-    return pts[0] if pts else "ALL"
+# -------------------- STATE / MODES (per-user in user_data) --------------------
+# Awaiting task photos:
+#   await = "TASK_PHOTO1" / "TASK_PHOTO2"
+#   task_mark = {point, part, task_id, task_name, photo1, photo2}
+#
+# Awaiting full shift open photo:
+#   await = "OPEN_FULL_PHOTO"
+#   open_full_point = ...
+#
+# Transfer select:
+#   transfer_step = "PICK_USER2"
+#
+# Help:
+#   help_mode = True; help_text; help_photos[]
+#
+# Close shift uses ConversationHandler
+
+# -------------------- REGISTRATION CONV --------------------
+
+REG_NAME, REG_CODE = range(2)
+
+# -------------------- CLOSE SHIFT CONV --------------------
+
+CASH_IN, SALES_CASHLESS, SALES_CASH, REFUNDS, RECEIPT1, RECEIPT2, CLEANUP = range(7)
+
+
+def parse_money(s: str) -> Optional[float]:
+    if not s:
+        return None
+    s = s.strip().replace(" ", "").replace(",", ".")
+    try:
+        v = float(s)
+        if v < 0:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+async def guard_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[UserRec]:
+    """Единая проверка доступа для сотрудников (не для админ-команд в группе)."""
+    uid = update.effective_user.id if update.effective_user else 0
+    u = get_user(uid)
+    if not u:
+        # не зарегистрирован
+        if update.message:
+            await update.message.reply_text("Сначала регистрация: /start")
+        elif update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Сначала регистрация: /start")
+        return None
+    if u.status == STATUS_BLOCKED:
+        if update.message:
+            await update.message.reply_text("Доступ к боту заблокирован администратором.")
+        elif update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Доступ к боту заблокирован администратором.")
+        return None
+    if u.status == STATUS_PENDING:
+        if update.message:
+            await update.message.reply_text("Ты уже отправил заявку. Ждём одобрения в группе контроля 🙂")
+        elif update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Заявка на одобрении. Ждём 🙂")
+        return None
+    return u
+
+
+# -------------------- HANDLERS: START / REGISTER --------------------
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
+    u = get_user(uid)
 
-    if is_user_active(user_id):
-        p = get_user_point(user_id)
-        if p:
-            context.user_data["point"] = p
-        await update.message.reply_text("Привет! Я тебя узнал 🙂\nМеню:", reply_markup=main_menu(user_id))
-
-        point = current_point(context, user_id)
-        await report_to_control(
-            context,
-            format_control("▶️ /start (активный пользователь)", update.effective_user.full_name, user_id, point=point),
-        )
+    if u and u.status == STATUS_BLOCKED:
+        await update.message.reply_text("Доступ к боту заблокирован администратором.")
         return ConversationHandler.END
 
+    if u and u.status == STATUS_PENDING:
+        await update.message.reply_text("Заявка уже отправлена. Ждём одобрения в группе контроля 🙂")
+        return ConversationHandler.END
+
+    if u and u.status == STATUS_ACTIVE:
+        # знакомый
+        text = "А я тебя помню! 🙂"
+        if not u.point:
+            await update.message.reply_text(text + "\n\nВыбери точку:", reply_markup=after_approved_kb())
+        else:
+            await update.message.reply_text(text + f"\n\nТвоя точка: {normalize_point(u.point)}\nЧто делаем?", reply_markup=open_choice_kb())
+        return ConversationHandler.END
+
+    # новая регистрация
     await update.message.reply_text(
         "Привет! Давай зарегистрируемся.\n\nНапиши своё имя:",
         reply_markup=ReplyKeyboardRemove(),
     )
-    return GET_NAME
+    return REG_NAME
 
 
-async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = normalize_name(update.message.text)
     if len(name) < 2:
         await update.message.reply_text("Имя слишком короткое. Напиши хотя бы 2 буквы.")
-        return GET_NAME
+        return REG_NAME
     context.user_data["reg_name"] = name
-
-    pts = load_points()
-    context.user_data["points_list"] = pts
-    await update.message.reply_text("Теперь выбери точку:", reply_markup=points_keyboard(pts, prefix="REGPOINT"))
-    return GET_POINT
+    await update.message.reply_text("Теперь введи код доступа:")
+    return REG_CODE
 
 
-async def handle_reg_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def reg_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = (update.message.text or "").strip()
+    if code != ACCESS_CODE:
+        await update.message.reply_text("Код неверный. Попробуй ещё раз:")
+        return REG_CODE
 
-    pts = context.user_data.get("points_list") or load_points()
-    try:
-        _, idx_s = q.data.split("|", 1)
-        idx = int(idx_s)
-        point = pts[idx]
-    except Exception:
-        await q.edit_message_text("Не понял выбор. Давай ещё раз:", reply_markup=points_keyboard(pts, prefix="REGPOINT"))
-        return GET_POINT
+    uid = update.effective_user.id
+    name = context.user_data.get("reg_name", update.effective_user.full_name)
 
-    user_id = q.from_user.id
-    name = context.user_data.get("reg_name", "Без имени")
-    upsert_user(user_id, name, point, status="Активен")
-    context.user_data["point"] = point
+    upsert_user(uid, name, point="", status=STATUS_PENDING)
 
-    await q.edit_message_text(f"Готово! Ты зарегистрирован.\nТочка: {point}")
-    await q.message.reply_text("Меню:", reply_markup=main_menu(user_id))
+    await update.message.reply_text(
+        "Заявка отправлена в группу контроля ✅\n"
+        "Как только одобрят — я напишу тебе сюда.",
+    )
 
+    # в контроль
     await report_to_control(
         context,
-        format_control("✅ Регистрация сотрудника", q.from_user.full_name, user_id, point=point),
+        format_control("🆕 Запрос регистрации", name, uid, details=["Нажмите кнопку ниже:"]),
     )
+    try:
+        await context.bot.send_message(
+            chat_id=CONTROL_GROUP_ID,
+            text=f"🆕 Запрос регистрации\nИмя: {name}\nID: {uid}\n\nОдобрить?",
+            reply_markup=approve_kb(uid),
+        )
+    except Exception as e:
+        log.warning("Не смог отправить approval-кнопки: %s", e)
+
     return ConversationHandler.END
 
 
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_user_active(user_id):
-        await update.message.reply_text("Сначала регистрация: /start")
-        return
-    await update.message.reply_text("Меню:", reply_markup=main_menu(user_id))
+# -------------------- ADMIN: APPROVE/BLOCK CALLBACKS --------------------
 
 
-async def back_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _is_control_chat(update: Update) -> bool:
+    if update.callback_query and update.callback_query.message:
+        return update.callback_query.message.chat_id == CONTROL_GROUP_ID
+    if update.message:
+        return update.message.chat_id == CONTROL_GROUP_ID
+    return False
+
+
+async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user_id = q.from_user.id
-    await q.edit_message_text("Меню:", reply_markup=main_menu(user_id))
 
-    point = current_point(context, user_id)
-    await report_to_control(
-        context,
-        format_control("↩️ Возврат в меню", q.from_user.full_name, user_id, point=point),
-    )
+    if not _is_control_chat(update):
+        await q.edit_message_text("Эти кнопки работают только в группе контроля.")
+        return
+
+    try:
+        _p, action, uid_s = q.data.split("|", 2)
+        uid = int(uid_s)
+    except Exception:
+        await q.edit_message_text("Некорректная команда.")
+        return
+
+    u = get_user(uid)
+    if not u:
+        await q.edit_message_text("Пользователь не найден в таблице users.")
+        return
+
+    if action == "APPROVE":
+        set_user_status(uid, STATUS_ACTIVE)
+        await q.edit_message_text(f"✅ Одобрено: {u.name} ({uid})")
+
+        # уведомить сотрудника
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="✅ Тебя одобрили!\nТеперь выбери точку:",
+                reply_markup=after_approved_kb(),
+            )
+        except Exception as e:
+            log.warning("Не смог написать пользователю после approve: %s", e)
+
+        await report_to_control(context, format_control("✅ Сотрудник одобрен", u.name, uid))
+
+    elif action == "BLOCK":
+        set_user_status(uid, STATUS_BLOCKED)
+        await q.edit_message_text(f"⛔️ Заблокирован: {u.name} ({uid})")
+        try:
+            await context.bot.send_message(chat_id=uid, text="⛔️ Доступ к боту заблокирован администратором.")
+        except Exception:
+            pass
+        await report_to_control(context, format_control("⛔️ Сотрудник заблокирован", u.name, uid))
+
+
+# -------------------- ADMIN COMMANDS (control group only) --------------------
+
+
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id != CONTROL_GROUP_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /block <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+    u = get_user(uid)
+    if not u:
+        await update.message.reply_text("Не найден в users.")
+        return
+    set_user_status(uid, STATUS_BLOCKED)
+    await update.message.reply_text(f"⛔️ Заблокирован: {u.name} ({uid})")
+    try:
+        await context.bot.send_message(chat_id=uid, text="⛔️ Доступ к боту заблокирован администратором.")
+    except Exception:
+        pass
+
+
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id != CONTROL_GROUP_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /unblock <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+    u = get_user(uid)
+    if not u:
+        await update.message.reply_text("Не найден в users.")
+        return
+    # если был заблокирован — делаем активным (если был pending — оставим pending)
+    new_status = STATUS_ACTIVE if u.status == STATUS_BLOCKED else u.status
+    set_user_status(uid, new_status)
+    await update.message.reply_text(f"✅ Разблокирован: {u.name} ({uid}), статус: {new_status}")
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat_id != CONTROL_GROUP_ID:
+        return
+    rows, has_header = _users_rows()
+    if not rows:
+        await update.message.reply_text("users пустой.")
+        return
+    start = 1 if has_header else 0
+    pending: List[UserRec] = []
+    for r in rows[start:]:
+        if len(r) < 4:
+            continue
+        try:
+            u = parse_user(r)
+        except Exception:
+            continue
+        if u.status == STATUS_PENDING:
+            pending.append(u)
+    if not pending:
+        await update.message.reply_text("На одобрении никого нет.")
+        return
+    lines = ["На одобрении:"]
+    for u in pending[:40]:
+        lines.append(f"• {u.name} — {u.user_id}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# -------------------- EMPLOYEE: POINT / OPEN --------------------
 
 
 async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
     pts = load_points()
     context.user_data["points_list"] = pts
-    await q.edit_message_text("Выбери точку:", reply_markup=points_keyboard(pts, prefix="POINT"))
+    await q.edit_message_text("Выбери точку:", reply_markup=points_kb(pts, prefix="POINT"))
 
 
-async def set_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def point_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return
 
     pts = context.user_data.get("points_list") or load_points()
     try:
-        _, idx_s = q.data.split("|", 1)
-        idx = int(idx_s)
-        point = pts[idx]
+        _p, idx_s = q.data.split("|", 1)
+        point = pts[int(idx_s)]
     except Exception:
-        await q.edit_message_text("Не понял выбор. Давай ещё раз:", reply_markup=points_keyboard(pts, prefix="POINT"))
+        await q.edit_message_text("Не понял выбор. Нажми «Выбор точки» ещё раз.", reply_markup=after_approved_kb())
         return
 
-    user_id = q.from_user.id
-    set_user_point(user_id, point)
-    context.user_data["point"] = point
-    await q.edit_message_text(f"Ок! Точка теперь: {point}", reply_markup=main_menu(user_id))
+    set_user_point(u.user_id, point)
+    u = get_user(u.user_id) or u
 
-    await report_to_control(
-        context,
-        format_control("📍 Смена точки", q.from_user.full_name, user_id, point=point),
-    )
+    await q.edit_message_text(f"Точка выбрана: {normalize_point(point)}\n\nТеперь выбери вариант открытия смены:", reply_markup=open_choice_kb())
+    await report_to_control(context, format_control("📍 Сотрудник выбрал точку", u.name, u.user_id, point=normalize_point(point)))
 
 
-async def view_plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def back_to_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+    await q.edit_message_text("Выбери точку:", reply_markup=after_approved_kb())
+
+
+async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    user_id = q.from_user.id
-    point = current_point(context, user_id)
-
-    tasks = load_tasks_for_today(point)
-    col = day_column_name()
-
-    if not tasks:
-        await q.edit_message_text(
-            f"На сегодня задач нет 🙂\n(колонка {col})",
-            reply_markup=main_menu(user_id),
-        )
+    u = await guard_employee(update, context)
+    if not u:
         return
 
-    done_ids = get_done_task_ids_for_today(point, user_id)
-
-    lines: List[str] = []
-    for t in tasks:
-        status = "✅" if t.task_id in done_ids else "⬜"
-        photo_icon = " 📸" if t.photo_required else ""
-        lines.append(f"{status} {t.task_name}{photo_icon}")
-
-    text = f"План на сегодня ({day_key()}, колонка {col}):\n" + "\n".join(lines)
-    await q.edit_message_text(text, reply_markup=main_menu(user_id))
-
-    await report_to_control(
-        context,
-        format_control(
-            "🧾 Просмотр плана уборки",
-            q.from_user.full_name,
-            user_id,
-            point=point,
-            details=[f"Колонка: {col}"],
-        ),
-    )
-
-
-async def mark_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    user_id = q.from_user.id
-    point = current_point(context, user_id)
-    tasks = load_tasks_for_today(point)
-
-    if not tasks:
-        await q.edit_message_text("Сегодня нечего отмечать 🙂", reply_markup=main_menu(user_id))
+    if not u.point:
+        await q.edit_message_text("Сначала выбери точку:", reply_markup=after_approved_kb())
         return
 
-    done_ids = get_done_task_ids_for_today(point, user_id)
-    remaining = [t for t in tasks if t.task_id not in done_ids]
-
-    if not remaining:
-        await q.edit_message_text("Все задачи на сегодня уже отмечены ✅", reply_markup=main_menu(user_id))
+    point = normalize_point(u.point)
+    d = day_key()
+    existing, _ = get_session(d, point)
+    _, role = user_open_context(u.user_id)
+    if role:
+        await q.edit_message_text("У тебя уже есть открытая смена.", reply_markup=shift_kb(role, point))
         return
 
-    context.user_data["today_tasks"] = remaining
-    await q.edit_message_text("Что выполнено? Нажми на задачу:", reply_markup=tasks_keyboard(remaining))
-
-
-async def done_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    user_id = q.from_user.id
-    point = current_point(context, user_id)
-
-    tasks: List[Task] = context.user_data.get("today_tasks", [])
     try:
-        _, idx_s = q.data.split("|", 1)
-        idx = int(idx_s)
-        task = tasks[idx]
+        _p, mode = q.data.split("|", 1)
     except Exception:
+        await q.edit_message_text("Некорректная команда.")
+        return
+
+    if existing and existing.state != "CLOSED":
+        # Уже есть смена на точке сегодня
+        if existing.mode == "FULL":
+            await q.edit_message_text("На этой точке уже открыта полная смена сегодня. Обратись к руководителю.", reply_markup=open_choice_kb())
+            return
+        if existing.mode == "HALF":
+            await q.edit_message_text("На этой точке уже идёт пол-смены сегодня. Обратись к руководителю.", reply_markup=open_choice_kb())
+            return
+
+    if mode == "FULL":
+        # требуем фото витрины
+        context.user_data["await"] = "OPEN_FULL_PHOTO"
+        context.user_data["open_full_point"] = point
         await q.edit_message_text(
-            "Я запутался 😅 Нажми «Отметить выполненное» ещё раз.",
-            reply_markup=main_menu(user_id),
+            "Полная смена.\n\n"
+            "Сначала пришли фото готовности витрины к смене 📸",
         )
         return
 
-    if task.photo_required:
-        context.user_data["await_photo_mode"] = "TASK"
-        context.user_data["await_photo_task"] = {
-            "task_id": task.task_id,
-            "task_name": task.task_name,
-            "photo_required": True,
-        }
-        await q.edit_message_text(
-            "Эта задача требует фото 📸\n\n"
-            "Сейчас просто отправь мне ОДНО фото сообщением.\n"
-            "После фото я сам запишу отметку.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="CANCEL_PHOTO")]]),
-        )
-        return
-
-    log_done(user_id, point, task, photo_file_id="")
-    await q.edit_message_text(f"Записал ✅\n{task.task_name}", reply_markup=main_menu(user_id))
-
-    await report_to_control(
-        context,
-        format_control(
-            "✅ Уборка выполнена (без фото)",
-            q.from_user.full_name,
-            user_id,
+    if mode == "HALF":
+        # открываем пол-смены 1
+        tasks = load_tasks_for_today(point)
+        part1, part2, split_index = split_tasks_half(tasks)
+        ts = now_tz().isoformat(timespec="seconds")
+        sess = Session(
+            session_id=make_session_id(d, point),
+            day=d,
             point=point,
-            details=[f"Задача: {task.task_name}"],
-        ),
-    )
+            mode="HALF",
+            state="OPEN1",
+            user1_id=str(u.user_id),
+            user1_name=u.name,
+            user1_start=ts,
+            user1_end="",
+            user2_id="",
+            user2_name="",
+            user2_start="",
+            user2_end="",
+            split_index=str(split_index),
+            updated_at=ts,
+        )
+        upsert_session(sess)
+
+        await q.edit_message_text(
+            "Пол смены открыта ✅\n"
+            f"Точка: {point}\n\n"
+            "Дальше:\n• План задач\n• Отметка задач\n• Красавчик помоги\n• Передача смены",
+            reply_markup=shift_kb("HALF1", point),
+        )
+        await report_to_control(
+            context,
+            format_control(
+                "⏱️ Открыта пол смены",
+                u.name,
+                u.user_id,
+                point=point,
+                details=[f"Время: {ts}"],
+            ),
+        )
+        return
 
 
-async def cancel_photo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
-    context.user_data.pop("await_photo_task", None)
-    context.user_data.pop("await_photo_mode", None)
-    await q.edit_message_text("Ок, отменил. Меню:", reply_markup=main_menu(user_id))
+# -------------------- PHOTO MESSAGE HANDLER (task/open/help) --------------------
 
 
-async def photo_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
-    point = current_point(context, user_id)
-    await q.edit_message_text(
-        "Как отправить фото:\n"
-        "1) Нажми «Отметить выполненное»\n"
-        "2) Выбери задачу с значком 📸\n"
-        "3) Потом отправь фото обычным сообщением\n\n"
-        "Я сам всё запишу в таблицу ✅",
-        reply_markup=main_menu(user_id),
-    )
-
-    await report_to_control(
-        context,
-        format_control("ℹ️ Открыта справка по фото", q.from_user.full_name, user_id, point=point),
-    )
+def _extract_photo_file_id(update: Update) -> Optional[str]:
+    if update.message and update.message.photo:
+        return update.message.photo[-1].file_id
+    if update.message and update.message.document and update.message.document.mime_type:
+        if update.message.document.mime_type.startswith("image/"):
+            return update.message.document.file_id
+    return None
 
 
 async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    mode = context.user_data.get("await_photo_mode")
-    payload = context.user_data.get("await_photo_task")
+    u = await guard_employee(update, context)
+    if not u:
+        return
 
-    file_id: Optional[str] = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
-        file_id = update.message.document.file_id
-
+    file_id = _extract_photo_file_id(update)
     if not file_id:
         return
 
-    if mode == "CLOSE_SHIFT1":
-        closing = context.user_data.get("closing_shift") or {}
-        point = closing.get("point", current_point(context, user_id))
+    # OPEN FULL PHOTO
+    if context.user_data.get("await") == "OPEN_FULL_PHOTO":
+        point = context.user_data.get("open_full_point") or normalize_point(u.point)
+        d = day_key()
+        existing, _ = get_session(d, point)
+        if existing and existing.state != "CLOSED":
+            # кто-то уже открыл
+            context.user_data.pop("await", None)
+            context.user_data.pop("open_full_point", None)
+            await update.message.reply_text("Смена на точке уже открыта. Меню:", reply_markup=open_choice_kb())
+            return
 
-        if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
-            text = (
-                "🧾 Чек 1 (открытие смены)\n"
-                f"Точка: {point}\n"
-                f"Сотрудник: {user_id}"
-            )
-            try:
-                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-            except Exception:
-                pass
-            try:
-                await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=file_id, caption=f"Чек 1 — точка: {point}")
-            except Exception:
-                pass
-
-        context.user_data["await_photo_mode"] = "CLOSE_SHIFT2"
-        await update.message.reply_text(
-            "Принял первый чек ✅\nТеперь пришли фото ЧЕКА ЗАКРЫТИЯ смены.",
-            reply_markup=main_menu(user_id),
+        ts = now_tz().isoformat(timespec="seconds")
+        sess = Session(
+            session_id=make_session_id(d, point),
+            day=d,
+            point=point,
+            mode="FULL",
+            state="OPEN_FULL",
+            user1_id=str(u.user_id),
+            user1_name=u.name,
+            user1_start=ts,
+            user1_end="",
+            user2_id="",
+            user2_name="",
+            user2_start="",
+            user2_end="",
+            split_index="",
+            updated_at=ts,
         )
-        return
+        upsert_session(sess)
 
-    if mode == "CLOSE_SHIFT2":
-        closing = context.user_data.get("closing_shift") or {}
-        point = closing.get("point", current_point(context, user_id))
-        missing = closing.get("missing_names", [])
+        context.user_data.pop("await", None)
+        context.user_data.pop("open_full_point", None)
 
-        if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
-            text = (
-                "🧾 Чек 2 (закрытие смены)\n"
-                f"Точка: {point}\n"
-                f"Сотрудник: {user_id}"
-            )
-            try:
-                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-            except Exception:
-                pass
-            try:
-                await context.bot.send_photo(chat_id=CONTROL_GROUP_ID, photo=file_id, caption=f"Чек 2 — точка: {point}")
-            except Exception:
-                pass
-
-        log_shift(user_id, point, "CLOSE_SHIFT")
-
-        base = f"Смена закрыта ✅\nТочка: {point}"
-        if missing:
-            base += "\n\n⚠️ План уборки выполнен не полностью. Это косяк 😈\nНе отмечены задачи:"
-            for name in missing:
-                base += f"\n• {name}"
-        else:
-            base += "\n\nПлан уборки выполнен полностью 💪"
-
-        details: List[str] = []
-        if missing:
-            details.append("⚠️ Косяк: план уборки НЕ полностью")
-            for n in missing[:15]:
-                details.append(f"• {n}")
-            if len(missing) > 15:
-                details.append("…")
-        else:
-            details.append("✅ План уборки полностью")
-
+        # отчет в контроль: открытие + фото
         await report_to_control(
             context,
-            format_control("🔒 Закрытие смены", update.effective_user.full_name, user_id, point=point, details=details),
+            format_control(
+                "🔓 Открыта смена (полная)",
+                u.name,
+                u.user_id,
+                point=point,
+                details=[f"Время: {ts}"],
+            ),
         )
-
-        context.user_data.pop("closing_shift", None)
-        context.user_data.pop("await_photo_mode", None)
-
-        await update.message.reply_text(base, reply_markup=main_menu(user_id))
-        return
-
-    if mode == "TASK" and payload:
-        point = current_point(context, user_id)
-        task = Task(
-            task_id=payload["task_id"],
-            task_name=payload["task_name"],
-            point=point,
-            photo_required=True,
-        )
-        log_done(user_id, point, task, photo_file_id=file_id)
-
-        if REPORT_TO_CONTROL and CONTROL_GROUP_ID != 0:
-            text = (
-                "📸 Уборка выполнена (с фото)\n"
-                f"Точка: {point}\n"
-                f"Сотрудник: {user_id}\n"
-                f"Задача: {task.task_name}"
-            )
-            try:
-                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-            except Exception:
-                pass
-            try:
-                await context.bot.send_photo(
-                    chat_id=CONTROL_GROUP_ID,
-                    photo=file_id,
-                    caption=f"Точка: {point}\nЗадача: {task.task_name}",
-                )
-            except Exception:
-                pass
-
-        context.user_data.pop("await_photo_task", None)
-        context.user_data.pop("await_photo_mode", None)
+        await report_photo_to_control(context, file_id, caption=f"📸 Готовность витрины\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})")
 
         await update.message.reply_text(
-            f"Готово ✅ Фото записал и отметил задачу:\n{task.task_name}",
-            reply_markup=main_menu(user_id),
+            f"Смена открыта ✅\nТочка: {point}",
+            reply_markup=shift_kb("FULL", point),
         )
         return
 
-    await update.message.reply_text(
-        "Фото получил 👍\n"
-        "Но сейчас я ни с какой задачей и сменой фото не жду.\n"
-        "Нажми «Отметить выполненное» или кнопку закрытия смены в меню.",
-        reply_markup=main_menu(user_id),
-    )
+    # TASK PHOTOS
+    if context.user_data.get("await") in ("TASK_PHOTO1", "TASK_PHOTO2"):
+        task_mark = context.user_data.get("task_mark") or {}
+        if not task_mark:
+            context.user_data.pop("await", None)
+            await update.message.reply_text("Я потерял контекст задачи 😅 Нажми «Отметить выполненную задачу» ещё раз.")
+            return
 
-    await report_to_control(
-        context,
-        format_control("📷 Фото отправлено вне сценария", update.effective_user.full_name, user_id, point=current_point(context, user_id)),
-        photo_file_id=file_id,
-        caption=f"Пользователь прислал фото вне сценария. user_id={user_id}",
-    )
+        if context.user_data["await"] == "TASK_PHOTO1":
+            task_mark["photo1"] = file_id
+            context.user_data["task_mark"] = task_mark
+            context.user_data["await"] = "TASK_PHOTO2"
+            await update.message.reply_text(
+                "Фото 1 принято ✅\n\n"
+                "Теперь пришли фото 2 (по желанию) 📸\n"
+                "или нажми «Пропустить».",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить фото 2", callback_data="SKIP_TASK_PHOTO2")]]),
+            )
+            return
 
+        if context.user_data["await"] == "TASK_PHOTO2":
+            task_mark["photo2"] = file_id
+            context.user_data["task_mark"] = task_mark
+            # финализируем
+            await finalize_task_done(update, context, u, task_mark)
+            return
 
-async def open_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    user_id = q.from_user.id
-    point = current_point(context, user_id)
-    log_shift(user_id, point, "OPEN_SHIFT")
-    await q.edit_message_text(f"Смена открыта ✅\nТочка: {point}", reply_markup=main_menu(user_id))
-
-    await report_to_control(
-        context,
-        format_control("🔓 Открытие смены", q.from_user.full_name, user_id, point=point),
-    )
-
-
-async def close_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    user_id = q.from_user.id
-    has_open, point = get_last_shift_state(user_id)
-    if not has_open or not point:
-        await q.edit_message_text("У тебя сейчас нет открытой смены 🤔", reply_markup=main_menu(user_id))
+    # HELP MODE photos
+    if context.user_data.get("help_mode"):
+        photos: List[str] = context.user_data.get("help_photos") or []
+        if len(photos) >= 4:
+            await update.message.reply_text("Уже 4 фото. Нажми «Отправить» 🙂")
+            return
+        photos.append(file_id)
+        context.user_data["help_photos"] = photos
+        left = 4 - len(photos)
+        await update.message.reply_text(
+            f"Фото добавлено ✅ (осталось до 4: {left})\nНажми «Отправить», когда закончишь.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Отправить", callback_data="HELP_SEND")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="HELP_CANCEL")],
+            ]),
+        )
         return
 
-    tasks = load_tasks_for_today(point)
-    done_ids = get_done_task_ids_for_today(point, user_id)
-    missing = [t.task_name for t in tasks if t.task_id not in done_ids]
+    # Вне сценария — мягко игнорируем
+    await update.message.reply_text("Фото получено 👍 Но сейчас я его ни для чего не жду.\nОткрой меню и действуй по кнопкам.")
 
-    context.user_data["closing_shift"] = {"point": point, "missing_names": missing}
-    context.user_data["await_photo_mode"] = "CLOSE_SHIFT1"
+
+# -------------------- TASK FLOW --------------------
+
+
+def assigned_tasks_for_user(sess: Session, role: str, point: str) -> Tuple[List[Task], str]:
+    """Возвращает (tasks_for_user, part_label). part_label: FULL | HALF1 | HALF2"""
+    tasks = load_tasks_for_today(point)
+    if role == "FULL":
+        return tasks, "FULL"
+    if role == "HALF1":
+        split_index = int(sess.split_index or "0")
+        return tasks[:split_index], "HALF1"
+    if role == "HALF2":
+        split_index = int(sess.split_index or "0")
+        return tasks[split_index:], "HALF2"
+    return [], role
+
+
+async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        await q.edit_message_text("Смена не открыта. Выбери точку и открой смену.", reply_markup=open_choice_kb())
+        return
+
+    point = normalize_point(sess.point)
+    day = sess.day
+    tasks, _part = assigned_tasks_for_user(sess, role, point)
+    done_ids = get_done_task_ids(day, point)
+
+    if not tasks:
+        await q.edit_message_text("На сегодня задач нет 🙂", reply_markup=shift_kb(role, point))
+        return
+
+    lines = [f"План задач ({day}, {point}):"]
+    for t in tasks:
+        status = "✅" if t.task_id in done_ids else "⬜"
+        lines.append(f"{status} {t.task_name}")
+
+    await q.edit_message_text("\n".join(lines), reply_markup=shift_kb(role, point))
+
+
+async def mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        await q.edit_message_text("Смена не открыта.", reply_markup=open_choice_kb())
+        return
+
+    point = normalize_point(sess.point)
+    day = sess.day
+    tasks, part = assigned_tasks_for_user(sess, role, point)
+
+    if not tasks:
+        await q.edit_message_text("Сегодня нечего отмечать 🙂", reply_markup=shift_kb(role, point))
+        return
+
+    done_ids = get_done_task_ids(day, point)
+    remaining = [t for t in tasks if t.task_id not in done_ids]
+
+    if not remaining:
+        await q.edit_message_text("Все твои задачи уже отмечены ✅", reply_markup=shift_kb(role, point))
+        return
+
+    context.user_data["mark_list"] = [{"task_id": t.task_id, "task_name": t.task_name} for t in remaining]
+    context.user_data["mark_point"] = point
+    context.user_data["mark_part"] = part
+    await q.edit_message_text("Что выполнено? Нажми задачу:", reply_markup=tasks_kb(remaining, done_ids=set()))
+
+
+async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        await q.edit_message_text("Смена не открыта.", reply_markup=open_choice_kb())
+        return
+
+    mark_list = context.user_data.get("mark_list") or []
+    try:
+        _p, idx_s = q.data.split("|", 1)
+        item = mark_list[int(idx_s)]
+    except Exception:
+        await q.edit_message_text("Не понял выбор. Нажми «Отметить выполненную задачу» ещё раз.", reply_markup=shift_kb(role, normalize_point(sess.point)))
+        return
+
+    point = context.user_data.get("mark_point") or normalize_point(sess.point)
+    part = context.user_data.get("mark_part") or role
+    day = sess.day
+
+    # защита от повторов (если кто-то уже отметил)
+    done_ids = get_done_task_ids(day, point)
+    if item["task_id"] in done_ids:
+        await q.edit_message_text("Эта задача уже отмечена ✅", reply_markup=shift_kb(role, point))
+        return
+
+    context.user_data["task_mark"] = {
+        "day": day,
+        "point": point,
+        "part": part,
+        "task_id": item["task_id"],
+        "task_name": item["task_name"],
+        "photo1": "",
+        "photo2": "",
+    }
+    context.user_data["await"] = "TASK_PHOTO1"
 
     await q.edit_message_text(
-        "Перед закрытием смены пришли, пожалуйста, ДВА фото чеков:\n"
-        "1️⃣ Фото чека ОТКРЫТИЯ смены\n"
-        "2️⃣ Фото чека ЗАКРЫТИЯ смены\n\n"
-        "Сначала отправь первый чек фото сообщением.",
-        reply_markup=main_menu(user_id),
+        f"Задача: {item['task_name']}\n\n"
+        "Пришли фото 1 (обязательно) 📸",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="BACK_SHIFT")]]),
     )
+
+
+async def skip_task_photo2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    task_mark = context.user_data.get("task_mark") or {}
+    if not task_mark or not task_mark.get("photo1"):
+        await q.edit_message_text("Сначала нужно прислать фото 1 🙂")
+        return
+
+    await finalize_task_done(update, context, u, task_mark, via_callback=True)
+
+
+async def finalize_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE, user: UserRec, task_mark: Dict[str, Any], via_callback: bool = False):
+    day = task_mark["day"]
+    point = task_mark["point"]
+    part = task_mark["part"]
+    task = Task(task_id=task_mark["task_id"], task_name=task_mark["task_name"], point=point)
+    photo1 = task_mark.get("photo1", "")
+    photo2 = task_mark.get("photo2", "")
+
+    # лог в таблицу
+    log_done(day, point, user, task, part, photo1, photo2)
+
+    # очистка состояния
+    context.user_data.pop("await", None)
+    context.user_data.pop("task_mark", None)
+
+    # контроль: сообщение + фото
+    await report_to_control(
+        context,
+        format_control(
+            "✅ Задача выполнена",
+            user.name,
+            user.user_id,
+            point=point,
+            details=[f"Задача: {task.task_name}", f"Часть смены: {part}"],
+        ),
+    )
+    if photo1:
+        await report_photo_to_control(context, photo1, caption=f"📸 Отчет 1\nТочка: {point}\nЗадача: {task.task_name}\nСотрудник: {user.name} ({user.user_id})")
+    if photo2:
+        await report_photo_to_control(context, photo2, caption=f"📸 Отчет 2\nТочка: {point}\nЗадача: {task.task_name}\nСотрудник: {user.name} ({user.user_id})")
+
+    # вернуть меню смены
+    sess, role = user_open_context(user.user_id)
+    if sess and role:
+        text = f"Готово ✅\nОтметил: {task.task_name}"
+        if via_callback and update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(text, reply_markup=shift_kb(role, normalize_point(sess.point)))
+                return
+            except Exception:
+                pass
+        await (update.effective_message.reply_text(text, reply_markup=shift_kb(role, normalize_point(sess.point))))
+
+
+# -------------------- HELP FLOW --------------------
+
+
+async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        await q.edit_message_text("Кнопка доступна только в рамках открытой смены.")
+        return
+
+    point = normalize_point(sess.point)
+    context.user_data["help_mode"] = True
+    context.user_data["help_point"] = point
+    context.user_data["help_photos"] = []
+    context.user_data.pop("help_text", None)
+
+    await q.edit_message_text(
+        "Надеюсь новости хорошие!? 🙂\n"
+        "Напиши всё что хочешь сказать и прикрепи фото если нужно.\n\n"
+        "Сначала отправь ТЕКСТ одним сообщением.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="HELP_CANCEL")]]),
+    )
+
+
+async def help_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("help_mode"):
+        return
+    if context.user_data.get("help_text"):
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    context.user_data["help_text"] = text
+    await update.message.reply_text(
+        "Текст принял ✅\n\nТеперь можешь отправить до 4 фото (по одному или альбомом).\n"
+        "Когда закончишь — нажми «Отправить».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Отправить", callback_data="HELP_SEND")],
+            [InlineKeyboardButton("✅ Отправить без фото", callback_data="HELP_SEND")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="HELP_CANCEL")],
+        ]),
+    )
+
+
+async def help_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    if not context.user_data.get("help_mode"):
+        await q.edit_message_text("Нет активного запроса.")
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        context.user_data.pop("help_mode", None)
+        await q.edit_message_text("Смена не открыта, сообщение не отправлено.")
+        return
+
+    point = context.user_data.get("help_point") or normalize_point(sess.point)
+    text = context.user_data.get("help_text") or "(без текста)"
+    photos: List[str] = context.user_data.get("help_photos") or []
 
     await report_to_control(
         context,
         format_control(
-            "🔒 Начато закрытие смены (ждём 2 фото чеков)",
-            q.from_user.full_name,
-            user_id,
+            "🤝 Красавчик помоги",
+            u.name,
+            u.user_id,
             point=point,
-            details=[f"Невыполненных задач: {len(missing)}"],
+            details=[f"Сообщение: {text}"],
         ),
     )
+    for i, pid in enumerate(photos[:4], start=1):
+        await report_photo_to_control(context, pid, caption=f"📸 Фото {i}\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})")
+
+    context.user_data.pop("help_mode", None)
+    context.user_data.pop("help_text", None)
+    context.user_data.pop("help_photos", None)
+    context.user_data.pop("help_point", None)
+
+    await q.edit_message_text("Отправил в группу контроля ✅", reply_markup=shift_kb(role, point))
+
+
+async def help_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    context.user_data.pop("help_mode", None)
+    context.user_data.pop("help_text", None)
+    context.user_data.pop("help_photos", None)
+    context.user_data.pop("help_point", None)
+
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if sess and role:
+        await q.edit_message_text("Ок, отменил.", reply_markup=shift_kb(role, normalize_point(sess.point)))
+    else:
+        await q.edit_message_text("Ок, отменил.", reply_markup=open_choice_kb())
+
+
+# -------------------- BACK BUTTONS --------------------
+
+
+async def back_main_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+    if not u.point:
+        await q.edit_message_text("Меню:", reply_markup=after_approved_kb())
+        return
+    await q.edit_message_text("Меню:", reply_markup=open_choice_kb())
+
+
+async def back_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        await q.edit_message_text("Смена не открыта.", reply_markup=open_choice_kb())
+        return
+    await q.edit_message_text("Меню смены:", reply_markup=shift_kb(role, normalize_point(sess.point)))
+
+
+# -------------------- TRANSFER HALF SHIFT --------------------
+
+
+async def transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+    sess, role = user_open_context(u.user_id)
+    if not sess or role != "HALF1":
+        await q.edit_message_text("Кнопка доступна только первому сотруднику пол-смены.")
+        return
+    point = normalize_point(sess.point)
+
+    # список активных сотрудников на этой точке
+    users = [x for x in list_active_users_by_point(point) if x.user_id != u.user_id]
+    if not users:
+        await q.edit_message_text(
+            "Нет активных сотрудников на этой точке для передачи.\n"
+            "Пусть второй сотрудник пройдёт регистрацию и выберет эту же точку.",
+            reply_markup=shift_kb(role, point),
+        )
+        return
+
+    rows = []
+    for x in users[:30]:
+        label = f"{x.name} ({x.user_id})"
+        rows.append([InlineKeyboardButton(label, callback_data=f"U2|{x.user_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_SHIFT")])
+
+    context.user_data["transfer_session_id"] = sess.session_id
+    await q.edit_message_text("Кому передаём смену?", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or role != "HALF1":
+        await q.edit_message_text("Сейчас ты не в режиме передачи пол-смены.")
+        return
+
+    point = normalize_point(sess.point)
+
+    try:
+        _p, uid_s = q.data.split("|", 1)
+        uid2 = int(uid_s)
+    except Exception:
+        await q.edit_message_text("Некорректный выбор.", reply_markup=shift_kb(role, point))
+        return
+
+    u2 = get_user(uid2)
+    if not u2 or u2.status != STATUS_ACTIVE:
+        await q.edit_message_text("Этот сотрудник сейчас не активен.", reply_markup=shift_kb(role, point))
+        return
+
+    if normalize_point(u2.point) != point:
+        await q.edit_message_text("Сотрудник должен выбрать ту же точку, что и ты.", reply_markup=shift_kb(role, point))
+        return
+
+    # проверка косяков по задачам первой половины
+    tasks_all = load_tasks_for_today(point)
+    split_index = int(sess.split_index or "0")
+    my_tasks = tasks_all[:split_index]
+    done_ids = get_done_task_ids(sess.day, point)
+    missing = [t.task_name for t in my_tasks if t.task_id not in done_ids]
+
+    if missing:
+        warn = "Лично претензий к тебе нет, но косячек с тебя снял! Руководитель будет крайне не доволен!😌\n" \
+               "Задания на сегодня тобою не выполнены."
+        await context.bot.send_message(chat_id=u.user_id, text=warn)
+        await report_to_control(
+            context,
+            format_control(
+                "⚠️ Косяк при передаче смены (пол смены)",
+                u.name,
+                u.user_id,
+                point=point,
+                details=["Не выполнены задачи первой половины:"] + [f"• {x}" for x in missing[:25]],
+            ),
+        )
+
+    # фиксируем конец у user1 и ставим ожидание
+    ts = now_tz().isoformat(timespec="seconds")
+    sess.state = "WAIT_ACCEPT"
+    sess.user1_end = ts
+    sess.user2_id = str(u2.user_id)
+    sess.user2_name = u2.name
+    upsert_session(sess)
+
+    # отправить запрос принятия user2
+    try:
+        await context.bot.send_message(
+            chat_id=u2.user_id,
+            text=f"Тебе передают смену на точке: {point}\nНажми «Принять смену».",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{sess.session_id}")]]),
+        )
+    except Exception as e:
+        log.warning("Не смог отправить accept user2: %s", e)
+
+    await report_to_control(
+        context,
+        format_control(
+            "🔁 Передача смены запрошена",
+            u.name,
+            u.user_id,
+            point=point,
+            details=[f"Кому: {u2.name} ({u2.user_id})", f"Время: {ts}"],
+        ),
+    )
+
+    await q.edit_message_text(
+        "Смену передал ✅\n"
+        "Второй сотрудник должен нажать «Принять смену».",
+        reply_markup=open_choice_kb(),
+    )
+
+
+async def accept_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    try:
+        _p, session_id = q.data.split("|", 1)
+    except Exception:
+        await q.edit_message_text("Некорректная команда.")
+        return
+
+    # найти сессию по day/point из session_id
+    try:
+        d, point = session_id.split("|", 1)
+    except Exception:
+        await q.edit_message_text("Некорректный session_id.")
+        return
+
+    sess, _idx = get_session(d, point)
+    if not sess or sess.session_id != session_id:
+        await q.edit_message_text("Смена не найдена или уже закрыта.")
+        return
+    if sess.mode != "HALF" or sess.state != "WAIT_ACCEPT":
+        await q.edit_message_text("Сейчас нельзя принять эту смену.")
+        return
+    if sess.user2_id != str(u.user_id):
+        await q.edit_message_text("Эта смена адресована другому сотруднику.")
+        return
+    if normalize_point(u.point) != normalize_point(sess.point):
+        await q.edit_message_text("У тебя должна быть выбрана та же точка. Нажми /start и выбери точку.")
+        return
+
+    ts = now_tz().isoformat(timespec="seconds")
+    sess.state = "OPEN2"
+    sess.user2_start = ts
+    upsert_session(sess)
+
+    await report_to_control(
+        context,
+        format_control(
+            "✅ Смена принята (пол смены)",
+            u.name,
+            u.user_id,
+            point=normalize_point(sess.point),
+            details=[f"Время: {ts}", f"От кого: {sess.user1_name} ({sess.user1_id})"],
+        ),
+    )
+
+    await q.edit_message_text(
+        f"Смена принята ✅\nТочка: {normalize_point(sess.point)}",
+        reply_markup=shift_kb("HALF2", normalize_point(sess.point)),
+    )
+
+
+# -------------------- CLOSE SHIFT CONVERSATION --------------------
+
+
+async def close_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or not role:
+        await q.edit_message_text("Смена не открыта.")
+        return ConversationHandler.END
+
+    point = normalize_point(sess.point)
+
+    if role not in ("FULL", "HALF2"):
+        await q.edit_message_text("Закрытие смены доступно только для полной смены или второго сотрудника пол-смены.")
+        return ConversationHandler.END
+
+    if not can_close_now(point):
+        _s, end = point_hours(point)
+        await q.edit_message_text(f"Кнопка «Закрыть смену» появится в конце смены (в {end.strftime('%H:%M')}).", reply_markup=shift_kb(role, point))
+        return ConversationHandler.END
+
+    # подготовим контекст закрытия
+    context.user_data["close"] = {
+        "session_id": sess.session_id,
+        "day": sess.day,
+        "point": point,
+        "mode": sess.mode,
+        "role": role,
+        "user_id": u.user_id,
+        "user_name": u.name,
+        "cash_in": None,
+        "sales_cashless": None,
+        "sales_cash": None,
+        "refunds": None,
+        "receipt1": "",
+        "receipt2": "",
+        "cleanup": [],
+    }
+
+    await q.edit_message_text("Закрытие смены.\n\nВведи наличные в начале смены (внесение):")
+    return CASH_IN
+
+
+async def close_cash_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = parse_money(update.message.text)
+    if v is None:
+        await update.message.reply_text("Не понял сумму. Введи числом, например: 1500 или 1500.50")
+        return CASH_IN
+    context.user_data["close"]["cash_in"] = v
+    await update.message.reply_text("Теперь введи продажи по безналу:")
+    return SALES_CASHLESS
+
+
+async def close_sales_cashless(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = parse_money(update.message.text)
+    if v is None:
+        await update.message.reply_text("Не понял сумму. Введи числом.")
+        return SALES_CASHLESS
+    context.user_data["close"]["sales_cashless"] = v
+    await update.message.reply_text("Теперь введи продажи по наличке:")
+    return SALES_CASH
+
+
+async def close_sales_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = parse_money(update.message.text)
+    if v is None:
+        await update.message.reply_text("Не понял сумму. Введи числом.")
+        return SALES_CASH
+    context.user_data["close"]["sales_cash"] = v
+    await update.message.reply_text("Теперь введи возвраты:")
+    return REFUNDS
+
+
+async def close_refunds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = parse_money(update.message.text)
+    if v is None:
+        await update.message.reply_text("Не понял сумму. Введи числом.")
+        return REFUNDS
+    context.user_data["close"]["refunds"] = v
+    await update.message.reply_text("Пришли фото 1 чека закрытия смены 📸")
+    return RECEIPT1
+
+
+async def close_receipt1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u.status != STATUS_ACTIVE:
+        await update.message.reply_text("Нет доступа.")
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужна фотография.")
+        return RECEIPT1
+
+    context.user_data["close"]["receipt1"] = file_id
+    await update.message.reply_text("Принял ✅ Теперь пришли фото 2 чека закрытия смены 📸")
+    return RECEIPT2
+
+
+async def close_receipt2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u.status != STATUS_ACTIVE:
+        await update.message.reply_text("Нет доступа.")
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужна фотография.")
+        return RECEIPT2
+
+    context.user_data["close"]["receipt2"] = file_id
+    await update.message.reply_text(
+        "Принял ✅\n\nТеперь пришли 4 фото убранного рабочего места и инвентаря (по одному сообщению). Фото 1/4 📸"
+    )
+    context.user_data["close"]["cleanup"] = []
+    return CLEANUP
+
+
+async def close_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u.status != STATUS_ACTIVE:
+        await update.message.reply_text("Нет доступа.")
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужна фотография.")
+        return CLEANUP
+
+    cl = context.user_data["close"]["cleanup"]
+    cl.append(file_id)
+    if len(cl) < 4:
+        await update.message.reply_text(f"Принял ✅ Фото {len(cl)}/4. Жду следующее.")
+        return CLEANUP
+
+    # ФИНАЛИЗАЦИЯ
+    close_ctx = context.user_data["close"]
+    point = close_ctx["point"]
+    day = close_ctx["day"]
+    session_id = close_ctx["session_id"]
+    mode = close_ctx["mode"]
+    cash_in = float(close_ctx["cash_in"])
+    sales_cashless = float(close_ctx["sales_cashless"])
+    sales_cash = float(close_ctx["sales_cash"])
+    refunds = float(close_ctx["refunds"])
+    total_sales = sales_cash + sales_cashless
+    cash_in_box = cash_in + sales_cash
+
+    # задачи по всей смене на точке (и для FULL, и для HALF2 при итоговом закрытии)
+    tasks_all = load_tasks_for_today(point)
+    done_ids = get_done_task_ids(day, point)
+    missing = [t.task_name for t in tasks_all if t.task_id not in done_ids]
+
+    note = ""
+    if missing:
+        note = "MISSING_TASKS"
+
+    # лог close_log
+    ts = now_tz().isoformat(timespec="seconds")
+    cleanup = cl[:4]
+    sheet_append(
+        SHEET_CLOSE,
+        [
+            ts, day, point, session_id, mode,
+            str(u.user_id), sanitize_for_sheets(u.name),
+            str(cash_in), str(sales_cashless), str(sales_cash), str(refunds),
+            str(total_sales), str(cash_in_box),
+            close_ctx["receipt1"], close_ctx["receipt2"],
+            cleanup[0], cleanup[1], cleanup[2], cleanup[3],
+            note,
+        ],
+    )
+
+    # закрыть сессию
+    sess, _ = get_session(day, point)
+    if sess and sess.session_id == session_id:
+        sess.state = "CLOSED"
+        if mode == "FULL":
+            sess.user1_end = ts
+        if mode == "HALF":
+            sess.user2_end = ts
+        upsert_session(sess)
+
+    # сообщение пользователю
+    if missing:
+        await update.message.reply_text(
+            "Лично претензий к тебе нет, но косячек с тебя снял! Руководитель будет крайне не доволен!😌\n"
+            "Задания на сегодня тобою не выполнены.\n\n"
+            "Смена закрыта ✅",
+            reply_markup=open_choice_kb(),
+        )
+    else:
+        await update.message.reply_text("Смена закрыта ✅", reply_markup=open_choice_kb())
+
+    # отчет в контроль (с цифрами)
+    summary = (
+        f"🔒 Закрытие смены\n"
+        f"Точка: {point}\n"
+        f"Сотрудник: {u.name} ({u.user_id})\n"
+        f"Внесение {cash_in}\n"
+        f"Наличные {sales_cash}\n"
+        f"Безнал {sales_cashless}\n"
+        f"Возвраты {refunds}\n"
+        f"Итого за смену {total_sales} (наличные+безнал)\n"
+        f"Наличные в кассе {cash_in_box} (внесение+наличные)\n"
+        f"Время: {ts}"
+    )
+    await report_to_control(context, summary)
+
+    # фото: 2 чека
+    await report_photo_to_control(context, close_ctx["receipt1"], caption=f"🧾 Чек 1\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})")
+    await report_photo_to_control(context, close_ctx["receipt2"], caption=f"🧾 Чек 2\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})")
+    # фото: уборка 4
+    for i, pid in enumerate(cleanup, start=1):
+        await report_photo_to_control(context, pid, caption=f"🧹 Уборка {i}/4\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})")
+
+    if missing:
+        await report_to_control(
+            context,
+            format_control(
+                "⚠️ Косяк: задачи не выполнены к закрытию смены",
+                u.name,
+                u.user_id,
+                point=point,
+                details=["Не выполнены:"] + [f"• {x}" for x in missing[:30]],
+            ),
+        )
+
+    # очистить контекст
+    context.user_data.pop("close", None)
+    return ConversationHandler.END
+
+
+async def close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("close", None)
+    await update.message.reply_text("Ок, отменил закрытие смены.", reply_markup=open_choice_kb())
+    return ConversationHandler.END
+
+
+# -------------------- REMINDERS --------------------
+
+
+REMINDER_TEXT = "Дружище, ты же помнишь о задачах? Давай не будем подводить друг друга и закроем план! 🙂"
+
+
+async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_REMINDERS:
+        return
+
+    d = day_key()
+    sessions = list_open_sessions()
+    if not sessions:
+        return
+
+    for s in sessions:
+        if s.day != d:
+            continue
+        point = normalize_point(s.point)
+        if not in_work_hours(point):
+            continue
+
+        # кто сейчас отвечает за задачи
+        targets: List[Tuple[int, str]] = []
+        if s.mode == "FULL" and s.state == "OPEN_FULL" and s.user1_id:
+            targets.append((int(s.user1_id), "FULL"))
+        elif s.mode == "HALF":
+            if s.state == "OPEN1" and s.user1_id:
+                targets.append((int(s.user1_id), "HALF1"))
+            elif s.state == "OPEN2" and s.user2_id:
+                targets.append((int(s.user2_id), "HALF2"))
+            else:
+                continue
+
+        tasks_all = load_tasks_for_today(point)
+        if not tasks_all:
+            continue
+
+        done_ids = get_done_task_ids(d, point)
+        for uid, role in targets:
+            # определить задачи для роли
+            if role == "FULL":
+                tasks = tasks_all
+            else:
+                split_index = int(s.split_index or "0")
+                tasks = tasks_all[:split_index] if role == "HALF1" else tasks_all[split_index:]
+
+            remaining = [t for t in tasks if t.task_id not in done_ids]
+            if not remaining:
+                continue
+
+            last_ts = last_task_action_ts(d, point, uid)
+            if last_ts is None:
+                # если не делал ничего и прошло >= idle от старта его смены
+                start_ts_str = s.user1_start if role in ("FULL", "HALF1") else s.user2_start
+                try:
+                    start_ts = datetime.fromisoformat(start_ts_str)
+                except Exception:
+                    start_ts = now_tz()
+                if now_tz() - start_ts < timedelta(minutes=REMINDER_IDLE_MINUTES):
+                    continue
+            else:
+                if now_tz() - last_ts < timedelta(minutes=REMINDER_IDLE_MINUTES):
+                    continue
+
+            try:
+                await context.bot.send_message(chat_id=uid, text=REMINDER_TEXT)
+            except Exception as e:
+                log.warning("Не смог отправить напоминание %s: %s", uid, e)
+
+
+# -------------------- ERROR HANDLER --------------------
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Ошибка: %s", context.error)
 
 
-# -------------------- HEALTH --------------------
+# -------------------- HEALTH SERVER (polling mode) --------------------
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -1135,14 +2165,14 @@ def start_health_server():
     threading.Thread(target=_run, daemon=True).start()
 
 
-# -------------------- APP --------------------
+# -------------------- APP BUILD --------------------
 
 
 def build_app() -> Application:
     require_env()
 
     try:
-        ensure_logs()
+        ensure_sheets()
     except HttpError as e:
         raise RuntimeError(
             "Не получилось подключиться к таблице.\n"
@@ -1154,39 +2184,73 @@ def build_app() -> Application:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Registration conversation
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_cmd)],
         states={
-            GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name)],
-            GET_POINT: [CallbackQueryHandler(handle_reg_point, pattern=r"^REGPOINT\|\d+$")],
+            REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
+            REG_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_code)],
         },
-        fallbacks=[CommandHandler("menu", menu_cmd)],
+        fallbacks=[],
     )
     app.add_handler(reg_conv)
 
-    app.add_handler(CommandHandler("menu", menu_cmd))
+    # Admin commands & buttons
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^ADM\|"))
+    app.add_handler(CommandHandler("block", cmd_block))
+    app.add_handler(CommandHandler("unblock", cmd_unblock))
+    app.add_handler(CommandHandler("pending", cmd_pending))
 
-    app.add_handler(CallbackQueryHandler(back_menu_cb, pattern=r"^BACK_MENU$"))
+    # Employee callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
-    app.add_handler(CallbackQueryHandler(set_point_cb, pattern=r"^POINT\|\d+$"))
+    app.add_handler(CallbackQueryHandler(point_pick_cb, pattern=r"^POINT\|\d+$"))
+    app.add_handler(CallbackQueryHandler(back_to_point_cb, pattern=r"^BACK_TO_POINT$"))
+    app.add_handler(CallbackQueryHandler(open_cb, pattern=r"^OPEN\|"))
 
-    app.add_handler(CallbackQueryHandler(view_plan_cb, pattern=r"^VIEW_PLAN$"))
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^PLAN$"))
+    app.add_handler(CallbackQueryHandler(mark_cb, pattern=r"^MARK$"))
+    app.add_handler(CallbackQueryHandler(task_pick_cb, pattern=r"^TASK\|\d+$"))
+    app.add_handler(CallbackQueryHandler(skip_task_photo2_cb, pattern=r"^SKIP_TASK_PHOTO2$"))
 
-    app.add_handler(CallbackQueryHandler(mark_done_cb, pattern=r"^MARK_DONE$"))
-    app.add_handler(CallbackQueryHandler(done_pick_cb, pattern=r"^DONE\|\d+$"))
-    app.add_handler(CallbackQueryHandler(cancel_photo_cb, pattern=r"^CANCEL_PHOTO$"))
-    app.add_handler(CallbackQueryHandler(photo_help_cb, pattern=r"^HELP_PHOTO$"))
+    app.add_handler(CallbackQueryHandler(help_cb, pattern=r"^HELP$"))
+    app.add_handler(CallbackQueryHandler(help_send_cb, pattern=r"^HELP_SEND$"))
+    app.add_handler(CallbackQueryHandler(help_cancel_cb, pattern=r"^HELP_CANCEL$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_text_message))
+
+    app.add_handler(CallbackQueryHandler(transfer_cb, pattern=r"^TRANSFER$"))
+    app.add_handler(CallbackQueryHandler(pick_user2_cb, pattern=r"^U2\|\d+$"))
+    app.add_handler(CallbackQueryHandler(accept_shift_cb, pattern=r"^ACCEPT\|"))
+
+    app.add_handler(CallbackQueryHandler(back_main_cb, pattern=r"^BACK_MAIN$"))
+    app.add_handler(CallbackQueryHandler(back_shift_cb, pattern=r"^BACK_SHIFT$"))
+
+    # Close shift conversation
+    close_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(close_start_cb, pattern=r"^CLOSE$")],
+        states={
+            CASH_IN: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_cash_in)],
+            SALES_CASHLESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_sales_cashless)],
+            SALES_CASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_sales_cash)],
+            REFUNDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_refunds)],
+            RECEIPT1: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, close_receipt1)],
+            RECEIPT2: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, close_receipt2)],
+            CLEANUP: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, close_cleanup)],
+        },
+        fallbacks=[CommandHandler("cancel", close_cancel)],
+        allow_reentry=True,
+    )
+    app.add_handler(close_conv)
+
+    # Photo handler (open full / task / help)
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_message))
-
-    app.add_handler(CallbackQueryHandler(open_shift_cb, pattern=r"^OPEN_SHIFT$"))
-    app.add_handler(CallbackQueryHandler(close_shift_cb, pattern=r"^CLOSE_SHIFT$"))
 
     app.add_error_handler(error_handler)
 
+    # Reminders
     if ENABLE_REMINDERS and app.job_queue:
-        interval = max(5, REMINDER_INTERVAL_MINUTES) * 60
-        app.job_queue.run_repeating(reminders_job, interval=interval, first=interval, name="cleaning_reminders")
-        log.info("Reminders enabled: every %s minutes", REMINDER_INTERVAL_MINUTES)
+        interval = max(1, REMINDER_CHECK_MINUTES) * 60
+        app.job_queue.run_repeating(reminders_job, interval=interval, first=interval, name="task_reminders")
+        log.info("Reminders enabled: check every %s minutes, idle=%s minutes", REMINDER_CHECK_MINUTES, REMINDER_IDLE_MINUTES)
     else:
         log.info("Reminders disabled or JobQueue not available")
 
@@ -1197,11 +2261,12 @@ def main():
     tg_app = build_app()
 
     log.info(
-        "BOOT: WEBHOOK_MODE=%s BASE=%s PATH=%s PORT=%s",
+        "BOOT: WEBHOOK_MODE=%s BASE=%s PATH=%s PORT=%s TZ=%s",
         WEBHOOK_MODE,
         WEBHOOK_BASE_URL,
         WEBHOOK_PATH,
         os.getenv("PORT"),
+        TIME_ZONE,
     )
 
     if WEBHOOK_MODE:
@@ -1241,8 +2306,7 @@ def main():
             log.info("Webhook mode ON: %s  port=%s", url, port)
 
         async def on_cleanup(_app: web.Application):
-            # КРИТИЧНО: НИЧЕГО НЕ ДЕЛАЕМ.
-            # stop()/shutdown() у PTB могут инициировать deleteWebhook -> ты это и видишь в логах.
+            # Важно: не дергать stop/shutdown, чтобы не удалять webhook на Render
             return
 
         aio = web.Application()
