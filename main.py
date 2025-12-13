@@ -733,10 +733,10 @@ def after_approved_kb() -> InlineKeyboardMarkup:
 
 
 def open_choice_kb() -> InlineKeyboardMarkup:
+    # Строгая логика: после выбора точки — только 2 кнопки открытия смены
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔓 Открыть смену (полная)", callback_data="OPEN|FULL")],
         [InlineKeyboardButton("⏱️ Открыть пол смены", callback_data="OPEN|HALF")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK_TO_POINT")],
     ])
 
 
@@ -750,7 +750,6 @@ def shift_kb(role: str, point: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🔁 Передать смену", callback_data="TRANSFER")])
     if role in ("FULL", "HALF2") and can_close_now(point):
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_MAIN")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -762,7 +761,6 @@ def tasks_kb(tasks: List[Task], done_ids: set[str]) -> InlineKeyboardMarkup:
         if len(label) > 48:
             label = label[:45] + "…"
         rows.append([InlineKeyboardButton(label, callback_data=f"TASK|{i}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_SHIFT")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -861,6 +859,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if u and u.status == STATUS_ACTIVE:
         # знакомый
         text = "А я тебя помню! 🙂"
+        sess, role = user_open_context(uid)
+        if sess and role:
+            point = normalize_point(sess.point)
+            await update.message.reply_text(text + f"\n\nСмена уже открыта на точке: {point}", reply_markup=shift_kb(role, point))
+            return ConversationHandler.END
         if not u.point:
             await update.message.reply_text(text + "\n\nВыбери точку:", reply_markup=after_approved_kb())
         else:
@@ -1060,6 +1063,13 @@ async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         return
 
+    # Строгая логика: если смена уже открыта — выбор точки запрещён
+    sess, role = user_open_context(u.user_id)
+    if sess and role:
+        point = normalize_point(sess.point)
+        await q.edit_message_text("Смена уже открыта. Действуй по кнопкам ниже.", reply_markup=shift_kb(role, point))
+        return
+
     pts = load_points()
     context.user_data["points_list"] = pts
     await q.edit_message_text("Выбери точку:", reply_markup=points_kb(pts, prefix="POINT"))
@@ -1071,6 +1081,13 @@ async def point_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     u = await guard_employee(update, context)
     if not u:
+        return
+
+    # Строгая логика: если смена уже открыта — смена точки запрещена
+    sess, role = user_open_context(u.user_id)
+    if sess and role:
+        point = normalize_point(sess.point)
+        await q.edit_message_text("Смена уже открыта. Сменить точку нельзя.", reply_markup=shift_kb(role, point))
         return
 
     pts = context.user_data.get("points_list") or load_points()
@@ -1431,9 +1448,7 @@ async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.edit_message_text(
         f"Задача: {item['task_name']}\n\n"
-        "Пришли фото 1 (обязательно) 📸",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="BACK_SHIFT")]]),
-    )
+        "Пришли фото 1 (обязательно) 📸",    )
 
 
 async def skip_task_photo2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1664,7 +1679,6 @@ async def transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for x in users[:30]:
         label = f"{x.name} ({x.user_id})"
         rows.append([InlineKeyboardButton(label, callback_data=f"U2|{x.user_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK_SHIFT")])
 
     context.user_data["transfer_session_id"] = sess.session_id
     await q.edit_message_text("Кому передаём смену?", reply_markup=InlineKeyboardMarkup(rows))
@@ -2064,6 +2078,7 @@ async def close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 REMINDER_TEXT = "Дружище, ты же помнишь о задачах? Давай не будем подводить друг друга и закроем план! 🙂"
+CLOSE_AVAILABLE_TEXT = "🔒 Кнопка «Закрыть смену» теперь доступна. Нажми её, чтобы закрыть смену."
 
 
 async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2074,6 +2089,37 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
     sessions = list_open_sessions()
     if not sessions:
         return
+
+    # Пушим сотруднику актуальное меню с кнопкой закрытия в момент окончания смены.
+    # (иначе у второго сотрудника «закрыть смену» не появится, если он принял смену раньше конца)
+    for s in sessions:
+        if s.day != d:
+            continue
+        point = normalize_point(s.point)
+        if not can_close_now(point):
+            continue
+        notify_uid = None
+        notify_role = None
+        if s.mode == "FULL" and s.state == "OPEN_FULL" and s.user1_id:
+            notify_uid = int(s.user1_id)
+            notify_role = "FULL"
+        elif s.mode == "HALF" and s.state == "OPEN2" and s.user2_id:
+            notify_uid = int(s.user2_id)
+            notify_role = "HALF2"
+        if notify_uid is None:
+            continue
+        flag_key = f"close_notified:{s.session_id}:{notify_uid}"
+        if context.bot_data.get(flag_key):
+            continue
+        context.bot_data[flag_key] = True
+        try:
+            await context.bot.send_message(
+                chat_id=notify_uid,
+                text=CLOSE_AVAILABLE_TEXT,
+                reply_markup=shift_kb(notify_role, point),
+            )
+        except Exception as e:
+            log.warning("Не смог отправить уведомление о закрытии %s: %s", notify_uid, e)
 
     for s in sessions:
         if s.day != d:
