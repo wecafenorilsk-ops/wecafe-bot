@@ -1497,6 +1497,13 @@ async def finalize_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # лог в таблицу
     log_done(day, point, user, task, part, photo1, photo2)
 
+    # reset throttling ONLY when a task is marked done
+    try:
+        flag = f"reminder_sent:{day}:{normalize_point(point)}:{user.user_id}"
+        context.bot_data[flag] = now_tz().isoformat(timespec="seconds")
+    except Exception:
+        pass
+
     # очистка состояния
     context.user_data.pop("await", None)
     context.user_data.pop("task_mark", None)
@@ -2187,6 +2194,18 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
             else:
                 if now_tz() - last_ts < timedelta(minutes=REMINDER_IDLE_MINUTES):
                     continue
+
+            # throttling: не чаще чем раз в REMINDER_IDLE_MINUTES для (день/точка/сотрудник)
+            flag = f"reminder_sent:{d}:{point}:{uid}"
+            last = context.bot_data.get(flag)  # ISO timestamp
+            if last:
+                try:
+                    last_dt = datetime.fromisoformat(last)
+                    if now_tz() - last_dt < timedelta(minutes=REMINDER_IDLE_MINUTES):
+                        continue
+                except Exception:
+                    pass
+            context.bot_data[flag] = now_tz().isoformat(timespec="seconds")
 
             try:
                 await context.bot.send_message(chat_id=uid, text=REMINDER_TEXT)
