@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import threading
+from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, date, time, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -86,6 +87,11 @@ HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080").strip() or "8080")
 ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "1").strip() != "0"
 REMINDER_CHECK_MINUTES = int(os.getenv("REMINDER_CHECK_MINUTES", "10").strip() or "10")  # проверяем чаще, пинаем раз в час
 REMINDER_IDLE_MINUTES = int(os.getenv("REMINDER_IDLE_MINUTES", "60").strip() or "60")
+
+# Ежедневные итоги (в группу контроля)
+ENABLE_DAILY_TOTALS = os.getenv("ENABLE_DAILY_TOTALS", "1").strip() != "0"
+DAILY_TOTALS_HOUR = int(os.getenv("DAILY_TOTALS_HOUR", "23").strip() or "23")
+DAILY_TOTALS_MINUTE = int(os.getenv("DAILY_TOTALS_MINUTE", "50").strip() or "50")
 
 # Листы (сохраняем “дух” текущего бота)
 SHEET_SCHEDULE = os.getenv("SHEET_SCHEDULE", "cleaning_schedule").strip()
@@ -2250,6 +2256,169 @@ def start_health_server():
 # -------------------- APP BUILD --------------------
 
 
+# -------------------- DAILY TOTALS (23:50) --------------------
+
+def _to_float(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        s = str(x).strip().replace(" ", "").replace(",", ".")
+        if not s:
+            return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _fmt_money(v: float) -> str:
+    try:
+        if abs(v - round(v)) < 1e-9:
+            return str(int(round(v)))
+        return f"{v:.2f}"
+    except Exception:
+        return "0"
+
+
+def collect_daily_totals(day: str) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    """Берём ПОСЛЕДНЕЕ закрытие на точке за день (по timestamp) и считаем итоги по точкам."""
+    points = [normalize_point(p) for p in load_points()]
+    # дефолт 0 по всем
+    metrics: Dict[str, Dict[str, float]] = {
+        p: {
+            "cash_in": 0.0,
+            "sales_cash": 0.0,
+            "sales_cashless": 0.0,
+            "refunds": 0.0,
+            "total_sales": 0.0,
+            "cash_in_box": 0.0,
+        } for p in points
+    }
+
+    rows = sheet_get(SHEET_CLOSE)
+    if not rows:
+        return points, metrics
+
+    start = 1 if (rows and is_header(rows[0], "timestamp")) else 0
+
+    # last close per point
+    best: Dict[str, Tuple[datetime, List[str]]] = {}
+    for r in rows[start:]:
+        if len(r) < 13:
+            continue
+        if (r[1] or "").strip() != day:
+            continue
+        p = normalize_point(r[2])
+        if p not in metrics:
+            # на случай, если в close_log точка есть, а в points её нет
+            metrics[p] = {
+                "cash_in": 0.0,
+                "sales_cash": 0.0,
+                "sales_cashless": 0.0,
+                "refunds": 0.0,
+                "total_sales": 0.0,
+                "cash_in_box": 0.0,
+            }
+            points.append(p)
+        ts_s = (r[0] or "").strip()
+        try:
+            ts = datetime.fromisoformat(ts_s)
+        except Exception:
+            # если вдруг формат поехал — считаем "самым старым"
+            ts = datetime(1970, 1, 1)
+        cur = best.get(p)
+        if cur is None or ts > cur[0]:
+            best[p] = (ts, r)
+
+    # заполняем по лучшим строкам
+    for p, (_ts, r) in best.items():
+        metrics[p]["cash_in"] = _to_float(r[7])
+        metrics[p]["sales_cashless"] = _to_float(r[8])
+        metrics[p]["sales_cash"] = _to_float(r[9])
+        metrics[p]["refunds"] = _to_float(r[10])
+        metrics[p]["total_sales"] = _to_float(r[11])
+        metrics[p]["cash_in_box"] = _to_float(r[12])
+
+    return points, metrics
+
+
+def build_totals_table_text(day: str, points: List[str], metrics: Dict[str, Dict[str, float]]) -> str:
+    headers = ["", "69", "Арена", "Музей", "Сочнева", "Итого"]
+
+    # порядок колонок ровно как в примере
+    order = ["69 Параллель", "Арена", "Музей", "Сочнева"]
+    cols = [p for p in order if p in metrics]  # только те, что есть
+    # если есть необычные точки — добавим их в конец
+    for p in points:
+        if p not in cols:
+            cols.append(p)
+
+    def val(p: str, key: str) -> float:
+        return float(metrics.get(p, {}).get(key, 0.0))
+
+    rows = [
+        ("Внесение", "cash_in"),
+        ("Наличные", "sales_cash"),
+        ("Безнал", "sales_cashless"),
+        ("Возвраты", "refunds"),
+        ("Итого за смену (наличные+безнал)", "total_sales"),
+        ("Итого в кассе (внесение+наличные)", "cash_in_box"),
+    ]
+
+    # ширины
+    col_names = [""] + cols + ["Итого"]
+    col_w = []
+    # первая колонка шире
+    col_w.append(max(10, max(len(r[0]) for r in rows)))
+    for p in cols:
+        col_w.append(max(len(p), 9))
+    col_w.append(9)
+
+    def fmt_cell(s: str, w: int, right: bool = False) -> str:
+        if right:
+            return s.rjust(w)
+        return s.ljust(w)
+
+    # header line
+    lines = []
+    header_cells = [fmt_cell("", col_w[0])]
+    for i, p in enumerate(cols, start=1):
+        header_cells.append(fmt_cell(p, col_w[i], right=False))
+    header_cells.append(fmt_cell("Итого", col_w[-1], right=False))
+    lines.append(" | ".join(header_cells))
+
+    # separator
+    lines.append("-" * (sum(col_w) + 3 * (len(col_w)-1)))
+
+    # data rows
+    for label, key in rows:
+        cells = [fmt_cell(label, col_w[0])]
+        row_total = 0.0
+        for i, p in enumerate(cols, start=1):
+            v = val(p, key)
+            row_total += v
+            cells.append(fmt_cell(_fmt_money(v), col_w[i], right=True))
+        cells.append(fmt_cell(_fmt_money(row_total), col_w[-1], right=True))
+        lines.append(" | ".join(cells))
+
+    return "\n".join(lines)
+
+
+async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_DAILY_TOTALS:
+        return
+    if CONTROL_GROUP_ID == 0:
+        return
+
+    d = day_key()
+    points, metrics = collect_daily_totals(d)
+    table = build_totals_table_text(d, points, metrics)
+
+    text = f"📊 Итоги за {d}\n<pre>{table}</pre>"
+    try:
+        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не смог отправить ежедневные итоги: %s", e)
+
 def build_app() -> Application:
     require_env()
 
@@ -2335,6 +2504,17 @@ def build_app() -> Application:
         log.info("Reminders enabled: check every %s minutes, idle=%s minutes", REMINDER_CHECK_MINUTES, REMINDER_IDLE_MINUTES)
     else:
         log.info("Reminders disabled or JobQueue not available")
+
+    # Daily totals at 23:50 (local TIME_ZONE)
+    if ENABLE_DAILY_TOTALS and app.job_queue:
+        try:
+            t = time(DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE)
+            app.job_queue.run_daily(daily_totals_job, time=t, timezone=_tz, name="daily_totals_2350")
+            log.info("Daily totals enabled: %02d:%02d (%s)", DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE, TIME_ZONE)
+        except Exception as e:
+            log.warning("Daily totals schedule failed: %s", e)
+    else:
+        log.info("Daily totals disabled or JobQueue not available")
 
     return app
 
