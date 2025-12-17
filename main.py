@@ -299,6 +299,8 @@ CLOSE_HEADER = [
     "note",
 ]
 
+DAILY_TOTALS_LOG_HEADER = ["timestamp", "day"]
+
 # -------------------- BOOTSTRAP SHEETS --------------------
 
 
@@ -309,11 +311,13 @@ def ensure_sheets():
     ensure_sheet_exists(SHEET_DONE)
     ensure_sheet_exists(SHEET_SESSIONS)
     ensure_sheet_exists(SHEET_CLOSE)
+    ensure_sheet_exists(SHEET_DAILY_TOTALS_LOG)
 
     ensure_header(SHEET_USERS, USERS_HEADER)
     ensure_header(SHEET_DONE, DONE_HEADER)
     ensure_header(SHEET_SESSIONS, SESSIONS_HEADER)
     ensure_header(SHEET_CLOSE, CLOSE_HEADER)
+    ensure_header(SHEET_DAILY_TOTALS_LOG, DAILY_TOTALS_LOG_HEADER)
 
 
 # -------------------- POINTS --------------------
@@ -700,8 +704,6 @@ def list_open_sessions() -> List[Session]:
 def user_open_context(user_id: int) -> Tuple[Optional[Session], Optional[str]]:
     """Возвращает (session, role) где role: 'FULL', 'HALF1', 'HALF2'."""
     d = day_key()
-    if daily_totals_sent(d):
-        return
     sessions = list_open_sessions()
     for s in sessions:
         if s.day != d:
@@ -825,6 +827,11 @@ REG_NAME, REG_CODE = range(2)
 # -------------------- CLOSE SHIFT CONV --------------------
 
 CASH_IN, SALES_CASHLESS, SALES_CASH, REFUNDS, RECEIPT1, RECEIPT2, CLEANUP = range(7)
+
+# -------------------- OPEN FULL SHIFT CONV --------------------
+
+OPEN_FULL_REPORT, OPEN_FULL_SHOWCASE, OPEN_FULL_MACARONS = range(3)
+
 
 
 def parse_money(s: str) -> Optional[float]:
@@ -1178,13 +1185,8 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if mode == "FULL":
-        # требуем фото витрины
-        context.user_data["await"] = "OPEN_FULL_PHOTO"
-        context.user_data["open_full_point"] = point
-        await q.edit_message_text(
-            "Полная смена.\n\n"
-            "Сначала пришли фото готовности витрины к смене 📸",
-        )
+        # Полная смена открывается через сценарий: отчет -> фото витрины -> фото макаронс
+        await q.edit_message_text("Полная смена: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
         return
 
     if mode == "HALF":
@@ -1230,6 +1232,197 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+# -------------------- OPEN FULL SHIFT (TEXT -> PHOTO -> PHOTO) --------------------
+
+async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    if not u.point:
+        await q.edit_message_text("Сначала выбери точку:", reply_markup=after_approved_kb())
+        return ConversationHandler.END
+
+    point = normalize_point(u.point)
+    d = day_key()
+
+    # если у пользователя уже есть открытая смена — запрещаем
+    sess_open, role = user_open_context(u.user_id)
+    if role:
+        p = normalize_point(sess_open.point) if sess_open else point
+        await q.edit_message_text("У тебя уже есть открытая смена.", reply_markup=shift_kb(role, p))
+        return ConversationHandler.END
+
+    existing, _ = get_session(d, point)
+    if existing and existing.state != "CLOSED":
+        if existing.mode == "FULL":
+            await q.edit_message_text(
+                "На этой точке уже открыта полная смена сегодня. Обратись к руководителю.",
+                reply_markup=open_choice_kb(),
+            )
+        else:
+            await q.edit_message_text(
+                "На этой точке уже идёт пол-смены сегодня. Обратись к руководителю.",
+                reply_markup=open_choice_kb(),
+            )
+        return ConversationHandler.END
+
+    # старт сценария
+    context.user_data["open_full_point"] = point
+    context.user_data["open_full_day"] = d
+    context.user_data.pop("open_full_report", None)
+    context.user_data.pop("open_full_photo_showcase", None)
+    context.user_data.pop("open_full_photo_macarons", None)
+
+    await q.edit_message_text(
+        "Полная смена.\n\n"
+        "Перечисли десерты в витрине и сроки их годности:",
+    )
+    return OPEN_FULL_REPORT
+
+
+async def open_full_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    if len(text) < 3:
+        await update.message.reply_text("Слишком коротко 🙂 Напиши списком десерты и сроки годности.")
+        return OPEN_FULL_REPORT
+
+    context.user_data["open_full_report"] = text
+    await update.message.reply_text(
+        "Отчет принят ✅\n\n"
+        "Теперь пришли фото витрины 📸",
+    )
+    return OPEN_FULL_SHOWCASE
+
+
+async def open_full_need_showcase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Нужно фото витрины 📸 Пришли фотографию, пожалуйста.")
+    return OPEN_FULL_SHOWCASE
+
+
+async def open_full_need_macarons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Нужно фото макаронс 📸 Пришли фотографию, пожалуйста.")
+    return OPEN_FULL_MACARONS
+
+
+async def open_full_showcase_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужно фото витрины 📸")
+        return OPEN_FULL_SHOWCASE
+
+    context.user_data["open_full_photo_showcase"] = file_id
+    await update.message.reply_text(
+        "Фото витрины принято ✅\n\n"
+        "Теперь пришли фото макаронс со сроком годности и вкусами 📸",
+    )
+    return OPEN_FULL_MACARONS
+
+
+async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужно фото макаронс 📸")
+        return OPEN_FULL_MACARONS
+
+    point = context.user_data.get("open_full_point") or normalize_point(u.point)
+    d = context.user_data.get("open_full_day") or day_key()
+
+    # защитная проверка: на всякий случай
+    existing, _ = get_session(d, point)
+    if existing and existing.state != "CLOSED":
+        context.user_data.pop("open_full_point", None)
+        context.user_data.pop("open_full_day", None)
+        context.user_data.pop("open_full_report", None)
+        context.user_data.pop("open_full_photo_showcase", None)
+        context.user_data.pop("open_full_photo_macarons", None)
+        await update.message.reply_text("Смена на точке уже открыта. Меню:", reply_markup=open_choice_kb())
+        return ConversationHandler.END
+
+    context.user_data["open_full_photo_macarons"] = file_id
+
+    report_text = (context.user_data.get("open_full_report") or "").strip()
+    photo_showcase = context.user_data.get("open_full_photo_showcase") or ""
+    photo_macarons = context.user_data.get("open_full_photo_macarons") or ""
+
+    ts = now_tz().isoformat(timespec="seconds")
+    sess = Session(
+        session_id=make_session_id(d, point),
+        day=d,
+        point=point,
+        mode="FULL",
+        state="OPEN_FULL",
+        user1_id=str(u.user_id),
+        user1_name=u.name,
+        user1_start=ts,
+        user1_end="",
+        user2_id="",
+        user2_name="",
+        user2_start="",
+        user2_end="",
+        split_index="",
+        updated_at=ts,
+    )
+    upsert_session(sess)
+
+    # очистка временных полей открытия
+    context.user_data.pop("open_full_point", None)
+    context.user_data.pop("open_full_day", None)
+    context.user_data.pop("open_full_report", None)
+    context.user_data.pop("open_full_photo_showcase", None)
+    context.user_data.pop("open_full_photo_macarons", None)
+
+    # отчет в контроль: открытие + текст + 2 фото
+    details = [f"Время: {ts}"]
+    if report_text:
+        details.append("Отчет витрины:")
+        details.append(report_text[:1500])
+
+    await report_to_control(
+        context,
+        format_control(
+            "🔓 Открыта смена (полная)",
+            u.name,
+            u.user_id,
+            point=point,
+            details=details,
+        ),
+    )
+
+    if photo_showcase:
+        cap = f"📸 Витрина (готовность)\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})"
+        if report_text:
+            cap += f"\n\nОтчет:\n{report_text[:800]}"
+        await report_photo_to_control(context, photo_showcase, caption=cap)
+
+    if photo_macarons:
+        await report_photo_to_control(
+            context,
+            photo_macarons,
+            caption=f"📸 Макаронс (срок годности и вкусы)\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})",
+        )
+
+    await update.message.reply_text(
+        f"Смена открыта ✅\nТочка: {point}",
+        reply_markup=shift_kb("FULL", point),
+    )
+    return ConversationHandler.END
+
 # -------------------- PHOTO MESSAGE HANDLER (task/open/help) --------------------
 
 
@@ -1250,60 +1443,8 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = _extract_photo_file_id(update)
     if not file_id:
         return
-
     # OPEN FULL PHOTO
-    if context.user_data.get("await") == "OPEN_FULL_PHOTO":
-        point = context.user_data.get("open_full_point") or normalize_point(u.point)
-        d = day_key()
-        existing, _ = get_session(d, point)
-        if existing and existing.state != "CLOSED":
-            # кто-то уже открыл
-            context.user_data.pop("await", None)
-            context.user_data.pop("open_full_point", None)
-            await update.message.reply_text("Смена на точке уже открыта. Меню:", reply_markup=open_choice_kb())
-            return
-
-        ts = now_tz().isoformat(timespec="seconds")
-        sess = Session(
-            session_id=make_session_id(d, point),
-            day=d,
-            point=point,
-            mode="FULL",
-            state="OPEN_FULL",
-            user1_id=str(u.user_id),
-            user1_name=u.name,
-            user1_start=ts,
-            user1_end="",
-            user2_id="",
-            user2_name="",
-            user2_start="",
-            user2_end="",
-            split_index="",
-            updated_at=ts,
-        )
-        upsert_session(sess)
-
-        context.user_data.pop("await", None)
-        context.user_data.pop("open_full_point", None)
-
-        # отчет в контроль: открытие + фото
-        await report_to_control(
-            context,
-            format_control(
-                "🔓 Открыта смена (полная)",
-                u.name,
-                u.user_id,
-                point=point,
-                details=[f"Время: {ts}"],
-            ),
-        )
-        await report_photo_to_control(context, file_id, caption=f"📸 Готовность витрины\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})")
-
-        await update.message.reply_text(
-            f"Смена открыта ✅\nТочка: {point}",
-            reply_markup=shift_kb("FULL", point),
-        )
-        return
+    # (открытие полной смены теперь идёт через ConversationHandler open_full_conv)
 
     # TASK PHOTOS
     if context.user_data.get("await") in ("TASK_PHOTO1", "TASK_PHOTO2"):
@@ -2406,13 +2547,13 @@ def build_totals_table_text(day: str, points: List[str], metrics: Dict[str, Dict
     return "\n".join(lines)
 
 
+
 def daily_totals_sent(day: str) -> bool:
     """Проверяем, отправляли ли уже итоги за этот день (переживает рестарты)."""
     try:
         rows = sheet_get(SHEET_DAILY_TOTALS_LOG)
         if not rows:
             return False
-        # если есть заголовок
         start = 1 if rows and rows[0] and str(rows[0][0]).strip().lower() == "timestamp" else 0
         for r in rows[start:]:
             if len(r) >= 2 and str(r[1]).strip() == day:
@@ -2427,7 +2568,6 @@ def mark_daily_totals_sent(day: str):
         sheet_append(SHEET_DAILY_TOTALS_LOG, [now_tz().isoformat(timespec="seconds"), day])
     except Exception as e:
         log.warning("Не смог записать daily_totals_log: %s", e)
-
 
 
 async def daily_totals_catchup_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2452,6 +2592,9 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     d = day_key()
+    if daily_totals_sent(d):
+        return
+
     points, metrics = collect_daily_totals(d)
     table = build_totals_table_text(d, points, metrics)
 
@@ -2499,6 +2642,26 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
     app.add_handler(CallbackQueryHandler(point_pick_cb, pattern=r"^POINT\|\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_point_cb, pattern=r"^BACK_TO_POINT$"))
+
+
+    # Open FULL shift conversation (report -> showcase photo -> macarons photo)
+    open_full_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(open_full_start_cb, pattern=r"^OPEN\|FULL$")],
+        states={
+            OPEN_FULL_REPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, open_full_report_text)],
+            OPEN_FULL_SHOWCASE: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, open_full_showcase_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, open_full_need_showcase),
+            ],
+            OPEN_FULL_MACARONS: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, open_full_macarons_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, open_full_need_macarons),
+            ],
+        },
+        fallbacks=[CommandHandler("start", start_cmd)],
+        allow_reentry=True,
+    )
+    app.add_handler(open_full_conv)
     app.add_handler(CallbackQueryHandler(open_cb, pattern=r"^OPEN\|"))
 
     app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^PLAN$"))
@@ -2553,8 +2716,8 @@ def build_app() -> Application:
         try:
             t = time(DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE)
             app.job_queue.run_daily(daily_totals_job, time=t, timezone=_tz, name="daily_totals_2350")
-            log.info("Daily totals enabled: %02d:%02d (%s)", DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE, TIME_ZONE)
             app.job_queue.run_once(daily_totals_catchup_job, when=5, name="daily_totals_catchup")
+            log.info("Daily totals enabled: %02d:%02d (%s)", DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE, TIME_ZONE)
         except Exception as e:
             log.warning("Daily totals schedule failed: %s", e)
     else:
