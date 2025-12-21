@@ -1086,6 +1086,43 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- EMPLOYEE: POINT / OPEN --------------------
 
 
+
+async def cmd_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручная команда в группе контроля: /totals [yesterday|YYYY-MM-DD]"""
+    if not update.message:
+        return
+    if update.message.chat_id != CONTROL_GROUP_ID:
+        return
+
+    # Parse date arg
+    d = day_key()
+    if context.args:
+        arg = (context.args[0] or "").strip().lower()
+        if arg in ("yesterday", "вчера"):
+            d = (now_tz().date() - timedelta(days=1)).isoformat()
+        else:
+            # Expect YYYY-MM-DD
+            try:
+                datetime.strptime(arg, "%Y-%m-%d")
+                d = arg
+            except Exception:
+                await update.message.reply_text("Использование: /totals [yesterday|YYYY-MM-DD]")
+                return
+
+    points, metrics = collect_daily_totals(d)
+    parts = build_totals_table_texts(d, points, metrics)
+
+    # Send in same order as scheduler
+    for title, payload in parts:
+        if payload.strip().startswith("ИТОГО:"):
+            text = f"📊 Итоги за {d}\n{payload}"
+            await update.message.reply_text(text)
+            continue
+
+        table = html.escape(payload)
+        text = f"📊 Итоги за {d} ({title})\n<pre>{table}</pre>"
+        await update.message.reply_text(text, parse_mode="HTML")
+
 async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2647,6 +2684,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("totals", cmd_totals))
 
     # Employee callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
