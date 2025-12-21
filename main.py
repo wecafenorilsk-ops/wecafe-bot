@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import base64
 import json
-import html
 import logging
 import os
 import threading
@@ -1086,43 +1085,6 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- EMPLOYEE: POINT / OPEN --------------------
 
 
-
-async def cmd_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная команда в группе контроля: /totals [yesterday|YYYY-MM-DD]"""
-    if not update.message:
-        return
-    if update.message.chat_id != CONTROL_GROUP_ID:
-        return
-
-    # Parse date arg
-    d = day_key()
-    if context.args:
-        arg = (context.args[0] or "").strip().lower()
-        if arg in ("yesterday", "вчера"):
-            d = (now_tz().date() - timedelta(days=1)).isoformat()
-        else:
-            # Expect YYYY-MM-DD
-            try:
-                datetime.strptime(arg, "%Y-%m-%d")
-                d = arg
-            except Exception:
-                await update.message.reply_text("Использование: /totals [yesterday|YYYY-MM-DD]")
-                return
-
-    points, metrics = collect_daily_totals(d)
-    parts = build_totals_table_texts(d, points, metrics)
-
-    # Send in same order as scheduler
-    for title, payload in parts:
-        if payload.strip().startswith("ИТОГО:"):
-            text = f"📊 Итоги за {d}\n{payload}"
-            await update.message.reply_text(text)
-            continue
-
-        table = html.escape(payload)
-        text = f"📊 Итоги за {d} ({title})\n<pre>{table}</pre>"
-        await update.message.reply_text(text, parse_mode="HTML")
-
 async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1196,6 +1158,15 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     point = normalize_point(u.point)
     d = day_key()
+
+    # mode: FULL or HALF
+    try:
+        _p, mode = (q.data or "").split("|", 1)
+    except Exception:
+        mode = "FULL"
+    if mode not in ("FULL", "HALF"):
+        mode = "FULL"
+    context.user_data["open_shift_mode"] = mode
     existing, _ = get_session(d, point)
     _, role = user_open_context(u.user_id)
     if role:
@@ -1223,45 +1194,8 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "HALF":
-        # открываем пол-смены 1
-        tasks = load_tasks_for_today(point)
-        part1, part2, split_index = split_tasks_half(tasks)
-        ts = now_tz().isoformat(timespec="seconds")
-        sess = Session(
-            session_id=make_session_id(d, point),
-            day=d,
-            point=point,
-            mode="HALF",
-            state="OPEN1",
-            user1_id=str(u.user_id),
-            user1_name=u.name,
-            user1_start=ts,
-            user1_end="",
-            user2_id="",
-            user2_name="",
-            user2_start="",
-            user2_end="",
-            split_index=str(split_index),
-            updated_at=ts,
-        )
-        upsert_session(sess)
-
-        await q.edit_message_text(
-            "Пол смены открыта ✅\n"
-            f"Точка: {point}\n\n"
-            "Дальше:\n• План задач\n• Отметка задач\n• Красавчик помоги\n• Передача смены",
-            reply_markup=shift_kb("HALF1", point),
-        )
-        await report_to_control(
-            context,
-            format_control(
-                "⏱️ Открыта пол смены",
-                u.name,
-                u.user_id,
-                point=point,
-                details=[f"Время: {ts}"],
-            ),
-        )
+        # Пол-смена открывается через тот же сценарий, что и полная: отчет -> фото витрины -> фото макаронс
+        await q.edit_message_text("Пол смены: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
         return
 
 
@@ -1281,6 +1215,15 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     point = normalize_point(u.point)
     d = day_key()
+
+    # mode: FULL or HALF (OPEN|FULL / OPEN|HALF)
+    try:
+        _p, mode = (q.data or "").split("|", 1)
+    except Exception:
+        mode = "FULL"
+    if mode not in ("FULL", "HALF"):
+        mode = "FULL"
+    context.user_data["open_shift_mode"] = mode
 
     # если у пользователя уже есть открытая смена — запрещаем
     sess_open, role = user_open_context(u.user_id)
@@ -1309,9 +1252,12 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("open_full_report", None)
     context.user_data.pop("open_full_photo_showcase", None)
     context.user_data.pop("open_full_photo_macarons", None)
+    context.user_data.pop("open_shift_mode", None)
+    context.user_data.pop("open_shift_mode", None)
 
+    label = "Пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "Полная смена"
     await q.edit_message_text(
-        "Полная смена.\n\n"
+        f"{label}.\n\n"
         "Перечисли десерты в витрине и сроки их годности:",
     )
     return OPEN_FULL_REPORT
@@ -1394,23 +1340,46 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     photo_macarons = context.user_data.get("open_full_photo_macarons") or ""
 
     ts = now_tz().isoformat(timespec="seconds")
-    sess = Session(
-        session_id=make_session_id(d, point),
-        day=d,
-        point=point,
-        mode="FULL",
-        state="OPEN_FULL",
-        user1_id=str(u.user_id),
-        user1_name=u.name,
-        user1_start=ts,
-        user1_end="",
-        user2_id="",
-        user2_name="",
-        user2_start="",
-        user2_end="",
-        split_index="",
-        updated_at=ts,
-    )
+    mode = context.user_data.get("open_shift_mode") or "FULL"
+    if mode == "HALF":
+        # половина смены: делим задачи и открываем OPEN1
+        tasks = load_tasks_for_today(point)
+        _part1, _part2, split_index = split_tasks_half(tasks)
+        sess = Session(
+            session_id=make_session_id(d, point),
+            day=d,
+            point=point,
+            mode="HALF",
+            state="OPEN1",
+            user1_id=str(u.user_id),
+            user1_name=u.name,
+            user1_start=ts,
+            user1_end="",
+            user2_id="",
+            user2_name="",
+            user2_start="",
+            user2_end="",
+            split_index=str(split_index),
+            updated_at=ts,
+        )
+    else:
+        sess = Session(
+            session_id=make_session_id(d, point),
+            day=d,
+            point=point,
+            mode="FULL",
+            state="OPEN_FULL",
+            user1_id=str(u.user_id),
+            user1_name=u.name,
+            user1_start=ts,
+            user1_end="",
+            user2_id="",
+            user2_name="",
+            user2_start="",
+            user2_end="",
+            split_index="",
+            updated_at=ts,
+        )
     upsert_session(sess)
 
     # очистка временных полей открытия
@@ -1419,6 +1388,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     context.user_data.pop("open_full_report", None)
     context.user_data.pop("open_full_photo_showcase", None)
     context.user_data.pop("open_full_photo_macarons", None)
+    context.user_data.pop("open_shift_mode", None)
 
     # отчет в контроль: открытие + текст + 2 фото
     details = [f"Время: {ts}"]
@@ -1429,7 +1399,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     await report_to_control(
         context,
         format_control(
-            "🔓 Открыта смена (полная)",
+            ("⏱️ Открыта пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "🔓 Открыта смена (полная)"),
             u.name,
             u.user_id,
             point=point,
@@ -1452,7 +1422,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text(
         f"Смена открыта ✅\nТочка: {point}",
-        reply_markup=shift_kb("FULL", point),
+        reply_markup=shift_kb("HALF1", point) if context.user_data.get("open_shift_mode") == "HALF" else shift_kb("FULL", point),
     )
     return ConversationHandler.END
 
@@ -2518,15 +2488,13 @@ def collect_daily_totals(day: str) -> Tuple[List[str], Dict[str, Dict[str, float
     return points, metrics
 
 
-def build_totals_table_texts(day: str, points: List[str], metrics: Dict[str, Dict[str, float]]) -> List[Tuple[str, str]]:
-    """Возвращает список (title, table_text) для отправки в группу контроля.
+def build_totals_table_text(day: str, points: List[str], metrics: Dict[str, Dict[str, float]]) -> str:
+    headers = ["", "69", "Арена", "Музей", "Сочнева", "Итого"]
 
-    Почему так: Telegram на телефонах режет широкие строки даже в <pre>.
-    Поэтому мы делим итоги на несколько компактных таблиц, чтобы не было переносов.
-    """
-    # Порядок точек как обычно
+    # порядок колонок ровно как в примере
     order = ["69 Параллель", "Арена", "Музей", "Сочнева"]
-    cols = [p for p in order if p in metrics]
+    cols = [p for p in order if p in metrics]  # только те, что есть
+    # если есть необычные точки — добавим их в конец
     for p in points:
         if p not in cols:
             cols.append(p)
@@ -2534,93 +2502,52 @@ def build_totals_table_texts(day: str, points: List[str], metrics: Dict[str, Dic
     def val(p: str, key: str) -> float:
         return float(metrics.get(p, {}).get(key, 0.0))
 
-    # Короткие названия столбцов (экономим ширину)
-    def short_point(p: str) -> str:
-        m = {
-            "69 Параллель": "69",
-            "Арена": "Ар",
-            "Музей": "Муз",
-            "Сочнева": "Соч",
-        }
-        if p in m:
-            return m[p]
-        s = p.replace(" ", "")
-        return s[:4] if len(s) > 4 else s
-
-    # Короткие подписи строк (экономим ширину)
     rows = [
-        ("Внес", "cash_in"),
-        ("Нал", "cash_cash"),
-        ("Безн", "cash_card"),
-        ("Возв", "returns"),
-        ("Смена", "shift_total"),
-        ("Касса", "cash_in_box"),
+        ("Внесение", "cash_in"),
+        ("Наличные", "sales_cash"),
+        ("Безнал", "sales_cashless"),
+        ("Возвраты", "refunds"),
+        ("Итого за смену (наличные+безнал)", "total_sales"),
+        ("Итого в кассе (внесение+наличные)", "cash_in_box"),
     ]
 
-    # Делим точки по 2 в таблице (чтобы не ломалось на мобильных)
-    groups: List[List[str]] = []
-    chunk = 2
-    for i in range(0, len(cols), chunk):
-        groups.append(cols[i:i+chunk])
-
-    def fmt_int(v: float) -> str:
-        # В отчёте в чат лучше без символов валюты и без лишних пробелов.
-        # Округляем до рублей.
-        try:
-            return str(int(round(v)))
-        except Exception:
-            return "0"
-
-    def build_table(cols2: List[str]) -> str:
-        # Колонки: [label] + points + [Σ]
-        headers = [""] + [short_point(p) for p in cols2] + ["Σ"]
-
-        # фиксированные ширины (под телефон)
-        w_label = 6  # под короткие строки
-        w_num = 8    # цифры до десятков миллионов
-        widths = [w_label] + [w_num]*len(cols2) + [w_num]
-
-        def cell(s: str, w: int, right: bool = False) -> str:
-            s = str(s)
-            if len(s) > w:
-                s = s[:w]
-            return s.rjust(w) if right else s.ljust(w)
-
-        lines: List[str] = []
-        hc = [cell(headers[0], widths[0])]
-        for i, h in enumerate(headers[1:], start=1):
-            hc.append(cell(h, widths[i], right=False))
-        lines.append(" | ".join(hc))
-        lines.append("-" * (sum(widths) + 3 * (len(widths)-1)))
-
-        for label, key in rows:
-            row_total = 0.0
-            rc = [cell(label, widths[0])]
-            for i, p in enumerate(cols2, start=1):
-                v = val(p, key)
-                row_total += v
-                rc.append(cell(fmt_int(v), widths[i], right=True))
-            rc.append(cell(fmt_int(row_total), widths[-1], right=True))
-            lines.append(" | ".join(rc))
-
-        return "\n".join(lines)
-
-    out: List[Tuple[str, str]] = []
-    for g in groups:
-        title = " + ".join(short_point(p) for p in g)
-        out.append((title, build_table(g)))
-
-    # Сводка по всем точкам (влезает всегда)
-    total_shift = 0.0
-    total_cash_in_box = 0.0
+    # ширины
+    col_names = [""] + cols + ["Итого"]
+    col_w = []
+    # первая колонка шире
+    col_w.append(max(10, max(len(r[0]) for r in rows)))
     for p in cols:
-        total_shift += val(p, "shift_total")
-        total_cash_in_box += val(p, "cash_in_box")
+        col_w.append(max(len(p), 9))
+    col_w.append(9)
 
-    summary = f"ИТОГО: смена={fmt_int(total_shift)}  касса={fmt_int(total_cash_in_box)} (руб.)"
-    out.append(("Сводка", summary))
-    return out
+    def fmt_cell(s: str, w: int, right: bool = False) -> str:
+        if right:
+            return s.rjust(w)
+        return s.ljust(w)
 
+    # header line
+    lines = []
+    header_cells = [fmt_cell("", col_w[0])]
+    for i, p in enumerate(cols, start=1):
+        header_cells.append(fmt_cell(p, col_w[i], right=False))
+    header_cells.append(fmt_cell("Итого", col_w[-1], right=False))
+    lines.append(" | ".join(header_cells))
+
+    # separator
+    lines.append("-" * (sum(col_w) + 3 * (len(col_w)-1)))
+
+    # data rows
+    for label, key in rows:
+        cells = [fmt_cell(label, col_w[0])]
+        row_total = 0.0
+        for i, p in enumerate(cols, start=1):
+            v = val(p, key)
+            row_total += v
+            cells.append(fmt_cell(_fmt_money(v), col_w[i], right=True))
+        cells.append(fmt_cell(_fmt_money(row_total), col_w[-1], right=True))
+        lines.append(" | ".join(cells))
+
+    return "\n".join(lines)
 
 
 async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2631,26 +2558,13 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
 
     d = day_key()
     points, metrics = collect_daily_totals(d)
+    table = build_totals_table_text(d, points, metrics)
 
-    # Компактный режим: несколько сообщений, чтобы на телефоне не разваливалось
-    parts = build_totals_table_texts(d, points, metrics)
-
-    for title, payload in parts:
-        if payload.strip().startswith("ИТОГО:"):
-            text = f"📊 Итоги за {d}\n{payload}"
-            try:
-                await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
-            except Exception as e:
-                log.warning("Не смог отправить ежедневные итоги (сводка): %s", e)
-            continue
-
-        table = html.escape(payload)
-        text = f"📊 Итоги за {d} ({title})\n<pre>{table}</pre>"
-        try:
-            await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text, parse_mode="HTML")
-        except Exception as e:
-            log.warning("Не смог отправить ежедневные итоги (%s): %s", title, e)
-
+    text = f"📊 Итоги за {d}\n<pre>{table}</pre>"
+    try:
+        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не смог отправить ежедневные итоги: %s", e)
 
 def build_app() -> Application:
     require_env()
@@ -2684,7 +2598,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("pending", cmd_pending))
-    app.add_handler(CommandHandler("totals", cmd_totals))
 
     # Employee callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
@@ -2694,7 +2607,7 @@ def build_app() -> Application:
 
     # Open FULL shift conversation (report -> showcase photo -> macarons photo)
     open_full_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(open_full_start_cb, pattern=r"^OPEN\|FULL$")],
+        entry_points=[CallbackQueryHandler(open_full_start_cb, pattern=r"^OPEN\|(FULL|HALF)$")],
         states={
             OPEN_FULL_REPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, open_full_report_text)],
             OPEN_FULL_SHOWCASE: [
