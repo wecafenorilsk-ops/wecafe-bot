@@ -2566,8 +2566,7 @@ def build_totals_table_texts(day: str, points: List[str], metrics: Dict[str, Dic
             rc.append(cell(fmt_int(row_total), widths[-1], right=True))
             lines.append(" | ".join(rc))
 
-        return "
-".join(lines)
+        return "\n".join(lines)
 
     out: List[Tuple[str, str]] = []
     for g in groups:
@@ -2601,8 +2600,7 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
 
     for title, payload in parts:
         if payload.strip().startswith("ИТОГО:"):
-            text = f"📊 Итоги за {d}
-{payload}"
+            text = f"📊 Итоги за {d}\n{payload}"
             try:
                 await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
             except Exception as e:
@@ -2610,8 +2608,7 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         table = html.escape(payload)
-        text = f"📊 Итоги за {d} ({title})
-<pre>{table}</pre>"
+        text = f"📊 Итоги за {d} ({title})\n<pre>{table}</pre>"
         try:
             await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text, parse_mode="HTML")
         except Exception as e:
