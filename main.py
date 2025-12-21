@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import html
 import logging
 import os
 import threading
@@ -102,7 +103,6 @@ SHEET_POINTS = os.getenv("SHEET_POINTS", "points").strip()
 SHEET_DONE = os.getenv("SHEET_DONE", "done_log").strip()                # отметки задач
 SHEET_SESSIONS = os.getenv("SHEET_SESSIONS", "shift_sessions").strip()  # состояния смен
 SHEET_CLOSE = os.getenv("SHEET_CLOSE", "close_log").strip()             # закрытие смены (цифры + фото)
-SHEET_DAILY_TOTALS_LOG = os.getenv("SHEET_DAILY_TOTALS_LOG", "daily_totals_log").strip()  # отметка отправки ежедневных итогов
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -299,8 +299,6 @@ CLOSE_HEADER = [
     "note",
 ]
 
-DAILY_TOTALS_LOG_HEADER = ["timestamp", "day"]
-
 # -------------------- BOOTSTRAP SHEETS --------------------
 
 
@@ -311,13 +309,11 @@ def ensure_sheets():
     ensure_sheet_exists(SHEET_DONE)
     ensure_sheet_exists(SHEET_SESSIONS)
     ensure_sheet_exists(SHEET_CLOSE)
-    ensure_sheet_exists(SHEET_DAILY_TOTALS_LOG)
 
     ensure_header(SHEET_USERS, USERS_HEADER)
     ensure_header(SHEET_DONE, DONE_HEADER)
     ensure_header(SHEET_SESSIONS, SESSIONS_HEADER)
     ensure_header(SHEET_CLOSE, CLOSE_HEADER)
-    ensure_header(SHEET_DAILY_TOTALS_LOG, DAILY_TOTALS_LOG_HEADER)
 
 
 # -------------------- POINTS --------------------
@@ -834,6 +830,7 @@ OPEN_FULL_REPORT, OPEN_FULL_SHOWCASE, OPEN_FULL_MACARONS = range(3)
 
 
 
+OPEN_HALF_REPORT, OPEN_HALF_SHOWCASE, OPEN_HALF_MACARONS = range(3, 6)
 def parse_money(s: str) -> Optional[float]:
     if not s:
         return None
@@ -1087,6 +1084,40 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для проверки/ручной отправки итогов. Только для группы контроля.
+    Использование:
+      /totals           -> сегодня
+      /totals yesterday -> вчера
+      /totals 2025-12-20
+    """
+    if not update.message or update.message.chat_id != CONTROL_GROUP_ID:
+        return
+
+    day = day_key()
+    if context.args:
+        a = (context.args[0] or "").strip().lower()
+        if a in ("y", "yesterday", "вчера"):
+            day = (now_tz().date() - timedelta(days=1)).isoformat()
+        else:
+            try:
+                _ = date.fromisoformat(a)
+                day = a
+            except Exception:
+                await update.message.reply_text("Использование: /totals или /totals YYYY-MM-DD или /totals yesterday")
+                return
+
+    points, metrics = collect_daily_totals(day)
+    table = build_totals_table_text(day, points, metrics)
+    table_safe = html.escape(table)
+    text = f"📊 Итоги за {day}\n<pre>{table_safe}</pre>"
+    try:
+        await update.message.reply_text(text, parse_mode="HTML")
+        if day == day_key():
+            context.bot_data[_daily_totals_flag(day)] = now_tz().isoformat(timespec="seconds")
+    except Exception as e:
+        log.warning("Не смог отправить /totals: %s", e)
+
 # -------------------- EMPLOYEE: POINT / OPEN --------------------
 
 
@@ -1190,49 +1221,8 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "HALF":
-        # открываем пол-смены 1
-        tasks = load_tasks_for_today(point)
-        part1, part2, split_index = split_tasks_half(tasks)
-        ts = now_tz().isoformat(timespec="seconds")
-        sess = Session(
-            session_id=make_session_id(d, point),
-            day=d,
-            point=point,
-            mode="HALF",
-            state="OPEN1",
-            user1_id=str(u.user_id),
-            user1_name=u.name,
-            user1_start=ts,
-            user1_end="",
-            user2_id="",
-            user2_name="",
-            user2_start="",
-            user2_end="",
-            split_index=str(split_index),
-            updated_at=ts,
-        )
-        upsert_session(sess)
-
-        await q.edit_message_text(
-            "Пол смены открыта ✅\n"
-            f"Точка: {point}\n\n"
-            "Дальше:\n• План задач\n• Отметка задач\n• Красавчик помоги\n• Передача смены",
-            reply_markup=shift_kb("HALF1", point),
-        )
-        await report_to_control(
-            context,
-            format_control(
-                "⏱️ Открыта пол смены",
-                u.name,
-                u.user_id,
-                point=point,
-                details=[f"Время: {ts}"],
-            ),
-        )
-        return
-
-
-# -------------------- OPEN FULL SHIFT (TEXT -> PHOTO -> PHOTO) --------------------
+        await q.edit_message_text("Пол-смены: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
+        return# -------------------- OPEN FULL SHIFT (TEXT -> PHOTO -> PHOTO) --------------------
 
 async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1420,6 +1410,203 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(
         f"Смена открыта ✅\nТочка: {point}",
         reply_markup=shift_kb("FULL", point),
+    )
+    return ConversationHandler.END
+
+# -------------------- OPEN HALF SHIFT (TEXT -> PHOTO -> PHOTO) --------------------
+
+async def open_half_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    if not u.point:
+        await q.edit_message_text("Сначала выбери точку:", reply_markup=after_approved_kb())
+        return ConversationHandler.END
+
+    point = normalize_point(u.point)
+    d = day_key()
+
+    # если у пользователя уже есть открытая смена — запрещаем
+    sess_open, role = user_open_context(u.user_id)
+    if role:
+        p = normalize_point(sess_open.point) if sess_open else point
+        await q.edit_message_text("У тебя уже есть открытая смена.", reply_markup=shift_kb(role, p))
+        return ConversationHandler.END
+
+    existing, _ = get_session(d, point)
+    if existing and existing.state != "CLOSED":
+        if existing.mode == "FULL":
+            await q.edit_message_text(
+                "На этой точке уже открыта полная смена сегодня. Обратись к руководителю.",
+                reply_markup=open_choice_kb(),
+            )
+        else:
+            await q.edit_message_text(
+                "На этой точке уже идёт пол-смены сегодня. Обратись к руководителю.",
+                reply_markup=open_choice_kb(),
+            )
+        return ConversationHandler.END
+
+    # старт сценария
+    context.user_data["open_half_point"] = point
+    context.user_data["open_half_day"] = d
+    context.user_data.pop("open_half_report", None)
+    context.user_data.pop("open_half_photo_showcase", None)
+    context.user_data.pop("open_half_photo_macarons", None)
+
+    await q.edit_message_text(
+        "Пол-смены.\n\n"
+        "Перечисли десерты в витрине и сроки их годности:",
+    )
+    return OPEN_HALF_REPORT
+
+
+async def open_half_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    if len(text) < 3:
+        await update.message.reply_text("Слишком коротко 🙂 Напиши списком десерты и сроки годности.")
+        return OPEN_HALF_REPORT
+
+    context.user_data["open_half_report"] = text
+    await update.message.reply_text(
+        "Отчет принят ✅\n\n"
+        "Теперь пришли фото витрины 📸",
+    )
+    return OPEN_HALF_SHOWCASE
+
+
+async def open_half_need_showcase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Нужно фото витрины 📸 Пришли фотографию, пожалуйста.")
+    return OPEN_HALF_SHOWCASE
+
+
+async def open_half_need_macarons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Нужно фото макаронс 📸 Пришли фотографию, пожалуйста.")
+    return OPEN_HALF_MACARONS
+
+
+async def open_half_showcase_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужно фото витрины 📸")
+        return OPEN_HALF_SHOWCASE
+
+    context.user_data["open_half_photo_showcase"] = file_id
+    await update.message.reply_text(
+        "Фото витрины принято ✅\n\n"
+        "Теперь пришли фото макаронс со сроком годности и вкусами 📸",
+    )
+    return OPEN_HALF_MACARONS
+
+
+async def open_half_macarons_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await guard_employee(update, context)
+    if not u:
+        return ConversationHandler.END
+
+    file_id = _extract_photo_file_id(update)
+    if not file_id:
+        await update.message.reply_text("Нужно фото макаронс 📸")
+        return OPEN_HALF_MACARONS
+
+    point = context.user_data.get("open_half_point") or normalize_point(u.point)
+    d = context.user_data.get("open_half_day") or day_key()
+
+    # защитная проверка
+    existing, _ = get_session(d, point)
+    if existing and existing.state != "CLOSED":
+        context.user_data.pop("open_half_point", None)
+        context.user_data.pop("open_half_day", None)
+        context.user_data.pop("open_half_report", None)
+        context.user_data.pop("open_half_photo_showcase", None)
+        context.user_data.pop("open_half_photo_macarons", None)
+        await update.message.reply_text("Смена на точке уже открыта. Меню:", reply_markup=open_choice_kb())
+        return ConversationHandler.END
+
+    context.user_data["open_half_photo_macarons"] = file_id
+
+    report_text = (context.user_data.get("open_half_report") or "").strip()
+    photo_showcase = context.user_data.get("open_half_photo_showcase") or ""
+    photo_macarons = context.user_data.get("open_half_photo_macarons") or ""
+
+    # открываем пол-смены 1
+    tasks = load_tasks_for_today(point)
+    _p1, _p2, split_index = split_tasks_half(tasks)
+
+    ts = now_tz().isoformat(timespec="seconds")
+    sess = Session(
+        session_id=make_session_id(d, point),
+        day=d,
+        point=point,
+        mode="HALF",
+        state="OPEN1",
+        user1_id=str(u.user_id),
+        user1_name=u.name,
+        user1_start=ts,
+        user1_end="",
+        user2_id="",
+        user2_name="",
+        user2_start="",
+        user2_end="",
+        split_index=str(split_index),
+        updated_at=ts,
+    )
+    upsert_session(sess)
+
+    # очистка временных полей открытия
+    context.user_data.pop("open_half_point", None)
+    context.user_data.pop("open_half_day", None)
+    context.user_data.pop("open_half_report", None)
+    context.user_data.pop("open_half_photo_showcase", None)
+    context.user_data.pop("open_half_photo_macarons", None)
+
+    # отчет в контроль: открытие + текст + 2 фото
+    details = [f"Время: {ts}"]
+    if report_text:
+        details.append("Отчет витрины:")
+        details.append(report_text[:1500])
+
+    await report_to_control(
+        context,
+        format_control(
+            "⏱️ Открыта пол смены",
+            u.name,
+            u.user_id,
+            point=point,
+            details=details,
+        ),
+    )
+
+    if photo_showcase:
+        cap = f"📸 Витрина (готовность)\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})"
+        if report_text:
+            cap += f"\n\nОтчет:\n{report_text[:800]}"
+        await report_photo_to_control(context, photo_showcase, caption=cap)
+
+    if photo_macarons:
+        await report_photo_to_control(
+            context,
+            photo_macarons,
+            caption=f"📸 Макаронс (срок годности и вкусы)\nТочка: {point}\nСотрудник: {u.name} ({u.user_id})",
+        )
+
+    await update.message.reply_text(
+        "Пол смены открыта ✅\n"
+        f"Точка: {point}\n\n"
+        "Дальше:\n• План задач\n• Отметка задач\n• Красавчик помоги\n• Передача смены",
+        reply_markup=shift_kb("HALF1", point),
     )
     return ConversationHandler.END
 
@@ -2260,6 +2447,12 @@ async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     d = day_key()
+    # на случай, если сервис уснул и пропустил ежедневный отчет в 23:50
+    try:
+        await daily_totals_catchup(context)
+    except Exception:
+        pass
+
     sessions = list_open_sessions()
     if not sessions:
         return
@@ -2547,42 +2740,31 @@ def build_totals_table_text(day: str, points: List[str], metrics: Dict[str, Dict
     return "\n".join(lines)
 
 
-
-def daily_totals_sent(day: str) -> bool:
-    """Проверяем, отправляли ли уже итоги за этот день (переживает рестарты)."""
-    try:
-        rows = sheet_get(SHEET_DAILY_TOTALS_LOG)
-        if not rows:
-            return False
-        start = 1 if rows and rows[0] and str(rows[0][0]).strip().lower() == "timestamp" else 0
-        for r in rows[start:]:
-            if len(r) >= 2 and str(r[1]).strip() == day:
-                return True
-        return False
-    except Exception:
-        return False
+def _daily_totals_flag(day: str) -> str:
+    return f"daily_totals_sent:{day}"
 
 
-def mark_daily_totals_sent(day: str):
-    try:
-        sheet_append(SHEET_DAILY_TOTALS_LOG, [now_tz().isoformat(timespec="seconds"), day])
-    except Exception as e:
-        log.warning("Не смог записать daily_totals_log: %s", e)
-
-
-async def daily_totals_catchup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Если бот перезапустили после 23:50 — отправим итоги сразу (один раз)."""
-    if not ENABLE_DAILY_TOTALS or CONTROL_GROUP_ID == 0:
+async def daily_totals_catchup(context: ContextTypes.DEFAULT_TYPE):
+    """Если сервис уснул на Render и пропустил 23:50 — отправим итоги при следующем пробуждении."""
+    if not ENABLE_DAILY_TOTALS:
         return
+    if CONTROL_GROUP_ID == 0:
+        return
+
+    now = now_tz()
+    try:
+        sched = _tz.localize(datetime(now.year, now.month, now.day, DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE))
+    except Exception:
+        sched = now.replace(hour=DAILY_TOTALS_HOUR, minute=DAILY_TOTALS_MINUTE, second=0, microsecond=0)
+
+    if now < sched:
+        return
+
     d = day_key()
-    if daily_totals_sent(d):
+    if context.bot_data.get(_daily_totals_flag(d)):
         return
-    try:
-        t = time(DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE)
-    except Exception:
-        t = time(23, 50)
-    if now_tz().time() >= t:
-        await daily_totals_job(context)
+
+    await daily_totals_job(context)
 
 
 async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2592,16 +2774,18 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     d = day_key()
-    if daily_totals_sent(d):
+    flag = _daily_totals_flag(d)
+    if context.bot_data.get(flag):
         return
 
     points, metrics = collect_daily_totals(d)
     table = build_totals_table_text(d, points, metrics)
+    table_safe = html.escape(table)
 
-    text = f"📊 Итоги за {d}\n<pre>{table}</pre>"
+    text = f"📊 Итоги за {d}\n<pre>{table_safe}</pre>"
     try:
         await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text, parse_mode="HTML")
-        mark_daily_totals_sent(d)
+        context.bot_data[flag] = now_tz().isoformat(timespec="seconds")
     except Exception as e:
         log.warning("Не смог отправить ежедневные итоги: %s", e)
 
@@ -2637,6 +2821,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("totals", cmd_totals))
 
     # Employee callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
@@ -2662,6 +2847,24 @@ def build_app() -> Application:
         allow_reentry=True,
     )
     app.add_handler(open_full_conv)
+    # Open HALF shift conversation (report -> showcase photo -> macarons photo)
+    open_half_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(open_half_start_cb, pattern=r"^OPEN\|HALF$")],
+        states={
+            OPEN_HALF_REPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, open_half_report_text)],
+            OPEN_HALF_SHOWCASE: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, open_half_showcase_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, open_half_need_showcase),
+            ],
+            OPEN_HALF_MACARONS: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, open_half_macarons_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, open_half_need_macarons),
+            ],
+        },
+        fallbacks=[CommandHandler("start", start_cmd)],
+        allow_reentry=True,
+    )
+    app.add_handler(open_half_conv)
     app.add_handler(CallbackQueryHandler(open_cb, pattern=r"^OPEN\|"))
 
     app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^PLAN$"))
@@ -2716,8 +2919,12 @@ def build_app() -> Application:
         try:
             t = time(DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE)
             app.job_queue.run_daily(daily_totals_job, time=t, timezone=_tz, name="daily_totals_2350")
-            app.job_queue.run_once(daily_totals_catchup_job, when=5, name="daily_totals_catchup")
             log.info("Daily totals enabled: %02d:%02d (%s)", DAILY_TOTALS_HOUR, DAILY_TOTALS_MINUTE, TIME_ZONE)
+            # catch-up checker (на случай сна сервиса): раз в 15 минут
+            try:
+                app.job_queue.run_repeating(daily_totals_catchup, interval=15*60, first=15*60, name="daily_totals_catchup")
+            except Exception:
+                pass
         except Exception as e:
             log.warning("Daily totals schedule failed: %s", e)
     else:
