@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import html
 import logging
 import os
 import threading
@@ -1252,8 +1253,10 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("open_full_report", None)
     context.user_data.pop("open_full_photo_showcase", None)
     context.user_data.pop("open_full_photo_macarons", None)
+    context.user_data.pop("open_shift_mode", None)
+    context.user_data.pop("open_shift_mode", None)
 
-    label = "Пол смены" if mode == "HALF" else "Полная смена"
+    label = "Пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "Полная смена"
     await q.edit_message_text(
         f"{label}.\n\n"
         "Перечисли десерты в витрине и сроки их годности:",
@@ -1397,7 +1400,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     await report_to_control(
         context,
         format_control(
-            ("⏱️ Открыта пол смены" if mode == "HALF" else "🔓 Открыта смена (полная)"),
+            ("⏱️ Открыта пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "🔓 Открыта смена (полная)"),
             u.name,
             u.user_id,
             point=point,
@@ -1420,7 +1423,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text(
         f"Смена открыта ✅\nТочка: {point}",
-        reply_markup=shift_kb("HALF1", point) if mode == "HALF" else shift_kb("FULL", point),
+        reply_markup=shift_kb("HALF1", point) if context.user_data.get("open_shift_mode") == "HALF" else shift_kb("FULL", point),
     )
     return ConversationHandler.END
 
@@ -2548,6 +2551,125 @@ def build_totals_table_text(day: str, points: List[str], metrics: Dict[str, Dict
     return "\n".join(lines)
 
 
+
+# -------------------- DAILY TOTALS (compact, mobile-friendly) --------------------
+
+def _short_point_name(p: str) -> str:
+    m = {
+        "69 Параллель": "69",
+        "Арена": "Ар",
+        "Музей": "Муз",
+        "Сочнева": "Соч",
+    }
+    if p in m:
+        return m[p]
+    s = (p or "").strip()
+    if len(s) <= 6:
+        return s or "?"
+    return s[:6] + "…"
+
+
+def _build_totals_table_compact(cols: List[str], metrics: Dict[str, Dict[str, float]]) -> str:
+    rows = [
+        ("Внес", "cash_in"),
+        ("Нал", "sales_cash"),
+        ("Безн", "sales_cashless"),
+        ("Возв", "refunds"),
+        ("Смена", "total_sales"),
+        ("Касса", "cash_in_box"),
+    ]
+
+    def val(p: str, key: str) -> float:
+        return float(metrics.get(p, {}).get(key, 0.0))
+
+    # widths
+    label_w = max(1, max(len(lbl) for lbl, _ in rows))
+    col_ws: List[int] = []
+    for p in cols:
+        w = len(_short_point_name(p))
+        for _, key in rows:
+            w = max(w, len(_fmt_money(val(p, key))))
+        col_ws.append(w)
+
+    sigma_w = len("Σ")
+    for _, key in rows:
+        sigma_w = max(sigma_w, len(_fmt_money(sum(val(p, key) for p in cols))))
+
+    def cell(s: str, w: int, right: bool = False) -> str:
+        s = s or ""
+        return s.rjust(w) if right else s.ljust(w)
+
+    lines: List[str] = []
+    header_cells = [cell("", label_w)] + [
+        cell(_short_point_name(p), w, right=True) for p, w in zip(cols, col_ws)
+    ] + [cell("Σ", sigma_w, right=True)]
+    lines.append(" | ".join(header_cells))
+    lines.append("-" * (sum([label_w] + col_ws + [sigma_w]) + 3 * (len(col_ws) + 1)))
+
+    for lbl, key in rows:
+        row_cells = [cell(lbl, label_w)]
+        row_sum = 0.0
+        for p, w in zip(cols, col_ws):
+            v = val(p, key)
+            row_sum += v
+            row_cells.append(cell(_fmt_money(v), w, right=True))
+        row_cells.append(cell(_fmt_money(row_sum), sigma_w, right=True))
+        lines.append(" | ".join(row_cells))
+
+    return "\n".join(lines)
+
+
+def build_totals_messages_compact(day: str, points: List[str], metrics: Dict[str, Dict[str, float]]):
+    order = ["69 Параллель", "Арена", "Музей", "Сочнева"]
+    cols: List[str] = [p for p in order if p in metrics]
+    for p in points:
+        if p not in cols:
+            cols.append(p)
+
+    groups: List[List[str]] = []
+    i = 0
+    while i < len(cols):
+        groups.append(cols[i:i + 2])
+        i += 2
+
+    tables = []
+    for g in groups:
+        title = " + ".join(_short_point_name(p) for p in g)
+        tables.append((title, _build_totals_table_compact(g, metrics)))
+
+    total_sales = sum(float(metrics.get(p, {}).get("total_sales", 0.0)) for p in cols)
+    cash_in_box = sum(float(metrics.get(p, {}).get("cash_in_box", 0.0)) for p in cols)
+    return tables, total_sales, cash_in_box
+
+
+async def _send_pre_table(bot, chat_id: int, header: str, table_text: str):
+    payload = html.escape(table_text)
+    text = header + "\n<pre>" + payload + "</pre>"
+
+    if len(text) <= 3900:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        return
+
+    # split by lines if too long
+    lines = payload.split("\n")
+    chunk: List[str] = []
+    cur_len = len(header) + len("<pre></pre>") + 2
+
+    for ln in lines:
+        add_len = len(ln) + 1
+        if chunk and cur_len + add_len > 3800:
+            body = "\n".join(chunk)
+            await bot.send_message(chat_id=chat_id, text=header + "\n<pre>" + body + "</pre>", parse_mode="HTML")
+            chunk = []
+            cur_len = len(header) + len("<pre></pre>") + 2
+        chunk.append(ln)
+        cur_len += add_len
+
+    if chunk:
+        body = "\n".join(chunk)
+        await bot.send_message(chat_id=chat_id, text=header + "\n<pre>" + body + "</pre>", parse_mode="HTML")
+
+
 async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
     if not ENABLE_DAILY_TOTALS:
         return
@@ -2556,13 +2678,58 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
 
     d = day_key()
     points, metrics = collect_daily_totals(d)
-    table = build_totals_table_text(d, points, metrics)
+    if not metrics:
+        return
 
-    text = f"📊 Итоги за {d}\n<pre>{table}</pre>"
     try:
-        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text, parse_mode="HTML")
+        tables, total_sales, cash_in_box = build_totals_messages_compact(d, points, metrics)
+        for title, table in tables:
+            await _send_pre_table(context.bot, CONTROL_GROUP_ID, f"📊 Итоги за {d} ({title})", table)
+        await context.bot.send_message(
+            chat_id=CONTROL_GROUP_ID,
+            text=f"📊 Итоги за {d}: Смена={_fmt_money(total_sales)}  Касса={_fmt_money(cash_in_box)}",
+        )
     except Exception as e:
         log.warning("Не смог отправить ежедневные итоги: %s", e)
+
+
+async def cmd_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual daily totals in control group: /totals [вчера|yesterday|YYYY-MM-DD]"""
+    if not ENABLE_DAILY_TOTALS:
+        await update.effective_message.reply_text("Итоги отключены.")
+        return
+
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    if CONTROL_GROUP_ID and chat_id != CONTROL_GROUP_ID:
+        await update.effective_message.reply_text("Команда доступна только в группе контроля.")
+        return
+
+    d = day_key()
+    if getattr(context, "args", None):
+        arg = " ".join(context.args).strip()
+        low = arg.lower()
+        if low in ("yesterday", "вчера"):
+            d = (now_tz() - timedelta(days=1)).date().isoformat()
+        else:
+            try:
+                d = date.fromisoformat(arg).isoformat()
+            except Exception:
+                await update.effective_message.reply_text("Формат: /totals [вчера|yesterday|YYYY-MM-DD]")
+                return
+
+    points, metrics = collect_daily_totals(d)
+    if not metrics:
+        await update.effective_message.reply_text(f"Нет данных за {d}.")
+        return
+
+    tables, total_sales, cash_in_box = build_totals_messages_compact(d, points, metrics)
+    for title, table in tables:
+        await _send_pre_table(context.bot, chat_id, f"📊 Итоги за {d} ({title})", table)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📊 Итоги за {d}: Смена={_fmt_money(total_sales)}  Касса={_fmt_money(cash_in_box)}",
+    )
+
 
 def build_app() -> Application:
     require_env()
@@ -2594,6 +2761,7 @@ def build_app() -> Application:
     # Admin commands & buttons
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^ADM\|"))
     app.add_handler(CommandHandler("block", cmd_block))
+    app.add_handler(CommandHandler("totals", cmd_totals))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("pending", cmd_pending))
 
