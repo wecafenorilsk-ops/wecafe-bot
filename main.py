@@ -1252,10 +1252,8 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("open_full_report", None)
     context.user_data.pop("open_full_photo_showcase", None)
     context.user_data.pop("open_full_photo_macarons", None)
-    context.user_data.pop("open_shift_mode", None)
-    context.user_data.pop("open_shift_mode", None)
 
-    label = "Пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "Полная смена"
+    label = "Пол смены" if mode == "HALF" else "Полная смена"
     await q.edit_message_text(
         f"{label}.\n\n"
         "Перечисли десерты в витрине и сроки их годности:",
@@ -1399,7 +1397,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     await report_to_control(
         context,
         format_control(
-            ("⏱️ Открыта пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "🔓 Открыта смена (полная)"),
+            ("⏱️ Открыта пол смены" if mode == "HALF" else "🔓 Открыта смена (полная)"),
             u.name,
             u.user_id,
             point=point,
@@ -1422,7 +1420,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text(
         f"Смена открыта ✅\nТочка: {point}",
-        reply_markup=shift_kb("HALF1", point) if context.user_data.get("open_shift_mode") == "HALF" else shift_kb("FULL", point),
+        reply_markup=shift_kb("HALF1", point) if mode == "HALF" else shift_kb("FULL", point),
     )
     return ConversationHandler.END
 
