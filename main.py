@@ -46,6 +46,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -78,6 +79,7 @@ ACCESS_CODE = os.getenv("ACCESS_CODE", "DreamTeam").strip()
 WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip() == "1"
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook").strip().lstrip("/")
+MAX_WEBHOOK_QUEUE = int(os.getenv("MAX_WEBHOOK_QUEUE", "1000").strip() or "1000")
 
 # Health
 ENABLE_HEALTH = os.getenv("ENABLE_HEALTH", "1").strip() != "0"
@@ -108,6 +110,20 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("wecafe-shift-bot")
+
+
+# -------------------- TELEGRAM HELPERS --------------------
+
+async def safe_edit(q, *args, **kwargs):
+    """edit_message_text without crashing on 'Message is not modified'."""
+    try:
+        return await safe_edit(q, *args, **kwargs)
+    except BadRequest as e:
+        # Happens when user taps the same inline button twice or markup/text didn't change.
+        if "Message is not modified" in str(e):
+            return None
+        raise
+
 
 # -------------------- TIME HELPERS --------------------
 
@@ -853,21 +869,21 @@ async def guard_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Сначала регистрация: /start")
         elif update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Сначала регистрация: /start")
+            await safe_edit(update.callback_query, "Сначала регистрация: /start")
         return None
     if u.status == STATUS_BLOCKED:
         if update.message:
             await update.message.reply_text("Доступ к боту заблокирован администратором.")
         elif update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Доступ к боту заблокирован администратором.")
+            await safe_edit(update.callback_query, "Доступ к боту заблокирован администратором.")
         return None
     if u.status == STATUS_PENDING:
         if update.message:
             await update.message.reply_text("Ты уже отправил заявку. Ждём одобрения в группе контроля 🙂")
         elif update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Заявка на одобрении. Ждём 🙂")
+            await safe_edit(update.callback_query, "Заявка на одобрении. Ждём 🙂")
         return None
     return u
 
@@ -968,24 +984,24 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if not _is_control_chat(update):
-        await q.edit_message_text("Эти кнопки работают только в группе контроля.")
+        await safe_edit(q, "Эти кнопки работают только в группе контроля.")
         return
 
     try:
         _p, action, uid_s = q.data.split("|", 2)
         uid = int(uid_s)
     except Exception:
-        await q.edit_message_text("Некорректная команда.")
+        await safe_edit(q, "Некорректная команда.")
         return
 
     u = get_user(uid)
     if not u:
-        await q.edit_message_text("Пользователь не найден в таблице users.")
+        await safe_edit(q, "Пользователь не найден в таблице users.")
         return
 
     if action == "APPROVE":
         set_user_status(uid, STATUS_ACTIVE)
-        await q.edit_message_text(f"✅ Одобрено: {u.name} ({uid})")
+        await safe_edit(q, f"✅ Одобрено: {u.name} ({uid})")
 
         # уведомить сотрудника
         try:
@@ -1001,7 +1017,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "BLOCK":
         set_user_status(uid, STATUS_BLOCKED)
-        await q.edit_message_text(f"⛔️ Заблокирован: {u.name} ({uid})")
+        await safe_edit(q, f"⛔️ Заблокирован: {u.name} ({uid})")
         try:
             await context.bot.send_message(chat_id=uid, text="⛔️ Доступ к боту заблокирован администратором.")
         except Exception:
@@ -1098,12 +1114,12 @@ async def choose_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess, role = user_open_context(u.user_id)
     if sess and role:
         point = normalize_point(sess.point)
-        await q.edit_message_text("Смена уже открыта. Действуй по кнопкам ниже.", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Смена уже открыта. Действуй по кнопкам ниже.", reply_markup=shift_kb(role, point))
         return
 
     pts = load_points()
     context.user_data["points_list"] = pts
-    await q.edit_message_text("Выбери точку:", reply_markup=points_kb(pts, prefix="POINT"))
+    await safe_edit(q, "Выбери точку:", reply_markup=points_kb(pts, prefix="POINT"))
 
 
 async def point_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1118,7 +1134,7 @@ async def point_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess, role = user_open_context(u.user_id)
     if sess and role:
         point = normalize_point(sess.point)
-        await q.edit_message_text("Смена уже открыта. Сменить точку нельзя.", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Смена уже открыта. Сменить точку нельзя.", reply_markup=shift_kb(role, point))
         return
 
     pts = context.user_data.get("points_list") or load_points()
@@ -1126,13 +1142,13 @@ async def point_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _p, idx_s = q.data.split("|", 1)
         point = pts[int(idx_s)]
     except Exception:
-        await q.edit_message_text("Не понял выбор. Нажми «Выбор точки» ещё раз.", reply_markup=after_approved_kb())
+        await safe_edit(q, "Не понял выбор. Нажми «Выбор точки» ещё раз.", reply_markup=after_approved_kb())
         return
 
     set_user_point(u.user_id, point)
     u = get_user(u.user_id) or u
 
-    await q.edit_message_text(f"Точка выбрана: {normalize_point(point)}\n\nТеперь выбери вариант открытия смены:", reply_markup=open_choice_kb())
+    await safe_edit(q, f"Точка выбрана: {normalize_point(point)}\n\nТеперь выбери вариант открытия смены:", reply_markup=open_choice_kb())
     await report_to_control(context, format_control("📍 Сотрудник выбрал точку", u.name, u.user_id, point=normalize_point(point)))
 
 
@@ -1142,7 +1158,7 @@ async def back_to_point_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await guard_employee(update, context)
     if not u:
         return
-    await q.edit_message_text("Выбери точку:", reply_markup=after_approved_kb())
+    await safe_edit(q, "Выбери точку:", reply_markup=after_approved_kb())
 
 
 async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1154,7 +1170,7 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not u.point:
-        await q.edit_message_text("Сначала выбери точку:", reply_markup=after_approved_kb())
+        await safe_edit(q, "Сначала выбери точку:", reply_markup=after_approved_kb())
         return
 
     point = normalize_point(u.point)
@@ -1171,32 +1187,32 @@ async def open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing, _ = get_session(d, point)
     _, role = user_open_context(u.user_id)
     if role:
-        await q.edit_message_text("У тебя уже есть открытая смена.", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "У тебя уже есть открытая смена.", reply_markup=shift_kb(role, point))
         return
 
     try:
         _p, mode = q.data.split("|", 1)
     except Exception:
-        await q.edit_message_text("Некорректная команда.")
+        await safe_edit(q, "Некорректная команда.")
         return
 
     if existing and existing.state != "CLOSED":
         # Уже есть смена на точке сегодня
         if existing.mode == "FULL":
-            await q.edit_message_text("На этой точке уже открыта полная смена сегодня. Обратись к руководителю.", reply_markup=open_choice_kb())
+            await safe_edit(q, "На этой точке уже открыта полная смена сегодня. Обратись к руководителю.", reply_markup=open_choice_kb())
             return
         if existing.mode == "HALF":
-            await q.edit_message_text("На этой точке уже идёт пол-смены сегодня. Обратись к руководителю.", reply_markup=open_choice_kb())
+            await safe_edit(q, "На этой точке уже идёт пол-смены сегодня. Обратись к руководителю.", reply_markup=open_choice_kb())
             return
 
     if mode == "FULL":
         # Полная смена открывается через сценарий: отчет -> фото витрины -> фото макаронс
-        await q.edit_message_text("Полная смена: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
+        await safe_edit(q, "Полная смена: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
         return
 
     if mode == "HALF":
         # Пол-смена открывается через тот же сценарий, что и полная: отчет -> фото витрины -> фото макаронс
-        await q.edit_message_text("Пол смены: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
+        await safe_edit(q, "Пол смены: сначала отчёт витрины, затем 2 фото. Пожалуйста, нажми кнопку ещё раз.")
         return
 
 
@@ -1211,7 +1227,7 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     if not u.point:
-        await q.edit_message_text("Сначала выбери точку:", reply_markup=after_approved_kb())
+        await safe_edit(q, "Сначала выбери точку:", reply_markup=after_approved_kb())
         return ConversationHandler.END
 
     point = normalize_point(u.point)
@@ -1230,18 +1246,18 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     sess_open, role = user_open_context(u.user_id)
     if role:
         p = normalize_point(sess_open.point) if sess_open else point
-        await q.edit_message_text("У тебя уже есть открытая смена.", reply_markup=shift_kb(role, p))
+        await safe_edit(q, "У тебя уже есть открытая смена.", reply_markup=shift_kb(role, p))
         return ConversationHandler.END
 
     existing, _ = get_session(d, point)
     if existing and existing.state != "CLOSED":
         if existing.mode == "FULL":
-            await q.edit_message_text(
+            await safe_edit(q, 
                 "На этой точке уже открыта полная смена сегодня. Обратись к руководителю.",
                 reply_markup=open_choice_kb(),
             )
         else:
-            await q.edit_message_text(
+            await safe_edit(q, 
                 "На этой точке уже идёт пол-смены сегодня. Обратись к руководителю.",
                 reply_markup=open_choice_kb(),
             )
@@ -1253,9 +1269,11 @@ async def open_full_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("open_full_report", None)
     context.user_data.pop("open_full_photo_showcase", None)
     context.user_data.pop("open_full_photo_macarons", None)
+    context.user_data.pop("open_shift_mode", None)
+    context.user_data.pop("open_shift_mode", None)
 
     label = "Пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "Полная смена"
-    await q.edit_message_text(
+    await safe_edit(q, 
         f"{label}.\n\n"
         "Перечисли десерты в витрине и сроки их годности:",
     )
@@ -1387,6 +1405,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     context.user_data.pop("open_full_report", None)
     context.user_data.pop("open_full_photo_showcase", None)
     context.user_data.pop("open_full_photo_macarons", None)
+    context.user_data.pop("open_shift_mode", None)
 
     # отчет в контроль: открытие + текст + 2 фото
     details = [f"Время: {ts}"]
@@ -1397,7 +1416,7 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
     await report_to_control(
         context,
         format_control(
-            ("⏱️ Открыта пол смены" if mode == "HALF" else "🔓 Открыта смена (полная)"),
+            ("⏱️ Открыта пол смены" if context.user_data.get("open_shift_mode") == "HALF" else "🔓 Открыта смена (полная)"),
             u.name,
             u.user_id,
             point=point,
@@ -1420,9 +1439,8 @@ async def open_full_macarons_photo(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text(
         f"Смена открыта ✅\nТочка: {point}",
-        reply_markup=shift_kb("HALF1", point) if mode == "HALF" else shift_kb("FULL", point),
+        reply_markup=shift_kb("HALF1", point) if context.user_data.get("open_shift_mode") == "HALF" else shift_kb("FULL", point),
     )
-    context.user_data.pop("open_shift_mode", None)
     return ConversationHandler.END
 
 # -------------------- PHOTO MESSAGE HANDLER (task/open/help) --------------------
@@ -1523,7 +1541,7 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
-        await q.edit_message_text("Смена не открыта. Выбери точку и открой смену.", reply_markup=open_choice_kb())
+        await safe_edit(q, "Смена не открыта. Выбери точку и открой смену.", reply_markup=open_choice_kb())
         return
 
     point = normalize_point(sess.point)
@@ -1532,7 +1550,7 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     done_ids = get_done_task_ids(day, point)
 
     if not tasks:
-        await q.edit_message_text("На сегодня задач нет 🙂", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "На сегодня задач нет 🙂", reply_markup=shift_kb(role, point))
         return
 
     lines = [f"План задач ({day}, {point}):"]
@@ -1540,7 +1558,7 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "✅" if t.task_id in done_ids else "⬜"
         lines.append(f"{status} {t.task_name}")
 
-    await q.edit_message_text("\n".join(lines), reply_markup=shift_kb(role, point))
+    await safe_edit(q, "\n".join(lines), reply_markup=shift_kb(role, point))
 
 
 async def mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1552,7 +1570,7 @@ async def mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
-        await q.edit_message_text("Смена не открыта.", reply_markup=open_choice_kb())
+        await safe_edit(q, "Смена не открыта.", reply_markup=open_choice_kb())
         return
 
     point = normalize_point(sess.point)
@@ -1560,20 +1578,20 @@ async def mark_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks, part = assigned_tasks_for_user(sess, role, point)
 
     if not tasks:
-        await q.edit_message_text("Сегодня нечего отмечать 🙂", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Сегодня нечего отмечать 🙂", reply_markup=shift_kb(role, point))
         return
 
     done_ids = get_done_task_ids(day, point)
     remaining = [t for t in tasks if t.task_id not in done_ids]
 
     if not remaining:
-        await q.edit_message_text("Все твои задачи уже отмечены ✅", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Все твои задачи уже отмечены ✅", reply_markup=shift_kb(role, point))
         return
 
     context.user_data["mark_list"] = [{"task_id": t.task_id, "task_name": t.task_name} for t in remaining]
     context.user_data["mark_point"] = point
     context.user_data["mark_part"] = part
-    await q.edit_message_text("Что выполнено? Нажми задачу:", reply_markup=tasks_kb(remaining, done_ids=set()))
+    await safe_edit(q, "Что выполнено? Нажми задачу:", reply_markup=tasks_kb(remaining, done_ids=set()))
 
 
 async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1585,7 +1603,7 @@ async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
-        await q.edit_message_text("Смена не открыта.", reply_markup=open_choice_kb())
+        await safe_edit(q, "Смена не открыта.", reply_markup=open_choice_kb())
         return
 
     mark_list = context.user_data.get("mark_list") or []
@@ -1593,7 +1611,7 @@ async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _p, idx_s = q.data.split("|", 1)
         item = mark_list[int(idx_s)]
     except Exception:
-        await q.edit_message_text("Не понял выбор. Нажми «Отметить выполненную задачу» ещё раз.", reply_markup=shift_kb(role, normalize_point(sess.point)))
+        await safe_edit(q, "Не понял выбор. Нажми «Отметить выполненную задачу» ещё раз.", reply_markup=shift_kb(role, normalize_point(sess.point)))
         return
 
     point = context.user_data.get("mark_point") or normalize_point(sess.point)
@@ -1603,7 +1621,7 @@ async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # защита от повторов (если кто-то уже отметил)
     done_ids = get_done_task_ids(day, point)
     if item["task_id"] in done_ids:
-        await q.edit_message_text("Эта задача уже отмечена ✅", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Эта задача уже отмечена ✅", reply_markup=shift_kb(role, point))
         return
 
     context.user_data["task_mark"] = {
@@ -1617,7 +1635,7 @@ async def task_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     context.user_data["await"] = "TASK_PHOTO1"
 
-    await q.edit_message_text(
+    await safe_edit(q, 
         f"Задача: {item['task_name']}\n\n"
         "Пришли фото 1 (обязательно) 📸",    )
 
@@ -1632,7 +1650,7 @@ async def skip_task_photo2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     task_mark = context.user_data.get("task_mark") or {}
     if not task_mark or not task_mark.get("photo1"):
-        await q.edit_message_text("Сначала нужно прислать фото 1 🙂")
+        await safe_edit(q, "Сначала нужно прислать фото 1 🙂")
         return
 
     await finalize_task_done(update, context, u, task_mark, via_callback=True)
@@ -1682,7 +1700,7 @@ async def finalize_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE,
         text = f"Готово ✅\nОтметил: {task.task_name}"
         if via_callback and update.callback_query:
             try:
-                await update.callback_query.edit_message_text(text, reply_markup=shift_kb(role, normalize_point(sess.point)))
+                await safe_edit(update.callback_query, text, reply_markup=shift_kb(role, normalize_point(sess.point)))
                 return
             except Exception:
                 pass
@@ -1701,7 +1719,7 @@ async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
-        await q.edit_message_text("Кнопка доступна только в рамках открытой смены.")
+        await safe_edit(q, "Кнопка доступна только в рамках открытой смены.")
         return
 
     point = normalize_point(sess.point)
@@ -1710,7 +1728,7 @@ async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["help_photos"] = []
     context.user_data.pop("help_text", None)
 
-    await q.edit_message_text(
+    await safe_edit(q, 
         "Надеюсь новости хорошие!? 🙂\n"
         "Напиши всё что хочешь сказать и прикрепи фото если нужно.\n\n"
         "Сначала отправь ТЕКСТ одним сообщением.",
@@ -1746,13 +1764,13 @@ async def help_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.user_data.get("help_mode"):
-        await q.edit_message_text("Нет активного запроса.")
+        await safe_edit(q, "Нет активного запроса.")
         return
 
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
         context.user_data.pop("help_mode", None)
-        await q.edit_message_text("Смена не открыта, сообщение не отправлено.")
+        await safe_edit(q, "Смена не открыта, сообщение не отправлено.")
         return
 
     point = context.user_data.get("help_point") or normalize_point(sess.point)
@@ -1777,7 +1795,7 @@ async def help_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("help_photos", None)
     context.user_data.pop("help_point", None)
 
-    await q.edit_message_text("Отправил в группу контроля ✅", reply_markup=shift_kb(role, point))
+    await safe_edit(q, "Отправил в группу контроля ✅", reply_markup=shift_kb(role, point))
 
 
 async def help_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1795,9 +1813,9 @@ async def help_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if sess and role:
-        await q.edit_message_text("Ок, отменил.", reply_markup=shift_kb(role, normalize_point(sess.point)))
+        await safe_edit(q, "Ок, отменил.", reply_markup=shift_kb(role, normalize_point(sess.point)))
     else:
-        await q.edit_message_text("Ок, отменил.", reply_markup=open_choice_kb())
+        await safe_edit(q, "Ок, отменил.", reply_markup=open_choice_kb())
 
 
 # -------------------- BACK BUTTONS --------------------
@@ -1810,9 +1828,9 @@ async def back_main_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         return
     if not u.point:
-        await q.edit_message_text("Меню:", reply_markup=after_approved_kb())
+        await safe_edit(q, "Меню:", reply_markup=after_approved_kb())
         return
-    await q.edit_message_text("Меню:", reply_markup=open_choice_kb())
+    await safe_edit(q, "Меню:", reply_markup=open_choice_kb())
 
 
 async def back_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1823,9 +1841,9 @@ async def back_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
-        await q.edit_message_text("Смена не открыта.", reply_markup=open_choice_kb())
+        await safe_edit(q, "Смена не открыта.", reply_markup=open_choice_kb())
         return
-    await q.edit_message_text("Меню смены:", reply_markup=shift_kb(role, normalize_point(sess.point)))
+    await safe_edit(q, "Меню смены:", reply_markup=shift_kb(role, normalize_point(sess.point)))
 
 
 # -------------------- TRANSFER HALF SHIFT --------------------
@@ -1839,14 +1857,14 @@ async def transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sess, role = user_open_context(u.user_id)
     if not sess or role != "HALF1":
-        await q.edit_message_text("Кнопка доступна только первому сотруднику пол-смены.")
+        await safe_edit(q, "Кнопка доступна только первому сотруднику пол-смены.")
         return
     point = normalize_point(sess.point)
 
     # список активных сотрудников на этой точке
     users = [x for x in list_active_users_all() if x.user_id != u.user_id]
     if not users:
-        await q.edit_message_text(
+        await safe_edit(q, 
             "Нет активных сотрудников на этой точке для передачи.\n"
             "Пусть второй сотрудник пройдёт регистрацию и выберет эту же точку.",
             reply_markup=shift_kb(role, point),
@@ -1859,7 +1877,7 @@ async def transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([InlineKeyboardButton(label, callback_data=f"U2|{x.user_id}")])
 
     context.user_data["transfer_session_id"] = sess.session_id
-    await q.edit_message_text("Кому передаём смену?", reply_markup=InlineKeyboardMarkup(rows))
+    await safe_edit(q, "Кому передаём смену?", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1871,7 +1889,7 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if not sess or role != "HALF1":
-        await q.edit_message_text("Сейчас ты не в режиме передачи пол-смены.")
+        await safe_edit(q, "Сейчас ты не в режиме передачи пол-смены.")
         return
 
     point = normalize_point(sess.point)
@@ -1880,12 +1898,12 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _p, uid_s = q.data.split("|", 1)
         uid2 = int(uid_s)
     except Exception:
-        await q.edit_message_text("Некорректный выбор.", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Некорректный выбор.", reply_markup=shift_kb(role, point))
         return
 
     u2 = get_user(uid2)
     if not u2 or u2.status != STATUS_ACTIVE:
-        await q.edit_message_text("Этот сотрудник сейчас не активен.", reply_markup=shift_kb(role, point))
+        await safe_edit(q, "Этот сотрудник сейчас не активен.", reply_markup=shift_kb(role, point))
         return
 
     # проверка косяков по задачам первой половины
@@ -1941,7 +1959,7 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
     )
 
-    await q.edit_message_text(
+    await safe_edit(q, 
         "Смену передал ✅\n"
         "Второй сотрудник должен нажать «Принять смену».",
         reply_markup=open_choice_kb(),
@@ -1959,25 +1977,25 @@ async def accept_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         _p, session_id = q.data.split("|", 1)
     except Exception:
-        await q.edit_message_text("Некорректная команда.")
+        await safe_edit(q, "Некорректная команда.")
         return
 
     # найти сессию по day/point из session_id
     try:
         d, point = session_id.split("|", 1)
     except Exception:
-        await q.edit_message_text("Некорректный session_id.")
+        await safe_edit(q, "Некорректный session_id.")
         return
 
     sess, _idx = get_session(d, point)
     if not sess or sess.session_id != session_id:
-        await q.edit_message_text("Смена не найдена или уже закрыта.")
+        await safe_edit(q, "Смена не найдена или уже закрыта.")
         return
     if sess.mode != "HALF" or sess.state != "WAIT_ACCEPT":
-        await q.edit_message_text("Сейчас нельзя принять эту смену.")
+        await safe_edit(q, "Сейчас нельзя принять эту смену.")
         return
     if sess.user2_id != str(u.user_id):
-        await q.edit_message_text("Эта смена адресована другому сотруднику.")
+        await safe_edit(q, "Эта смена адресована другому сотруднику.")
         return
 
 
@@ -2000,7 +2018,7 @@ async def accept_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
     )
 
-    await q.edit_message_text(
+    await safe_edit(q, 
         f"Смена принята ✅\nТочка: {normalize_point(sess.point)}",
         reply_markup=shift_kb("HALF2", normalize_point(sess.point)),
     )
@@ -2019,13 +2037,13 @@ async def close_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sess, role = user_open_context(u.user_id)
     if not sess or not role:
-        await q.edit_message_text("Смена не открыта.")
+        await safe_edit(q, "Смена не открыта.")
         return ConversationHandler.END
 
     point = normalize_point(sess.point)
 
     if role not in ("FULL", "HALF1", "HALF2"):
-        await q.edit_message_text("Закрытие смены доступно только для полной смены или сотрудников пол-смены.")
+        await safe_edit(q, "Закрытие смены доступно только для полной смены или сотрудников пол-смены.")
         return ConversationHandler.END
 
     # подготовим контекст закрытия
@@ -2046,7 +2064,7 @@ async def close_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "cleanup": [],
     }
 
-    await q.edit_message_text("Закрытие смены.\n\nВведи наличные в начале смены (внесение):")
+    await safe_edit(q, "Закрытие смены.\n\nВведи наличные в начале смены (внесение):")
     return CASH_IN
 
 
@@ -2880,7 +2898,10 @@ def main():
 
             try:
                 update = Update.de_json(data, tg_app.bot)
-                await tg_app.update_queue.put(update)
+                if tg_app.update_queue.qsize() >= MAX_WEBHOOK_QUEUE:
+                    log.warning("Webhook queue overflow (qsize=%s >= %s) — dropping update", tg_app.update_queue.qsize(), MAX_WEBHOOK_QUEUE)
+                else:
+                    await tg_app.update_queue.put(update)
             except Exception as e:
                 log.exception("Webhook update processing error: %s", e)
 
@@ -2893,7 +2914,7 @@ def main():
             url = f"{WEBHOOK_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
             await tg_app.bot.set_webhook(
                 url=url,
-                drop_pending_updates=False,
+                drop_pending_updates=True,
                 allowed_updates=Update.ALL_TYPES,
             )
             log.info("Webhook mode ON: %s  port=%s", url, port)
