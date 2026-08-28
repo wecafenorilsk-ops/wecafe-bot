@@ -17,15 +17,18 @@ WeCafe Shift & Tasks Bot (Telegram) — версия под сценарий Dre
 Деплой:
 - Render / Webhook или Polling (как в текущем коде)
 - Google JSON ключ: GOOGLE_SHEETS_CREDENTIALS_FILE или GOOGLE_SHEETS_CREDENTIALS_JSON_B64 (base64)
+- Для Webhook: WEBHOOK_SECRET
 """
 
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import html
 import logging
 import os
+import re
 import threading
 from io import BytesIO
 from dataclasses import dataclass
@@ -79,6 +82,7 @@ ACCESS_CODE = os.getenv("ACCESS_CODE", "DreamTeam").strip()
 WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip() == "1"
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook").strip().lstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 MAX_WEBHOOK_QUEUE = int(os.getenv("MAX_WEBHOOK_QUEUE", "1000").strip() or "1000")
 
 # Health
@@ -105,6 +109,7 @@ SHEET_POINTS = os.getenv("SHEET_POINTS", "points").strip()
 SHEET_DONE = os.getenv("SHEET_DONE", "done_log").strip()                # отметки задач
 SHEET_SESSIONS = os.getenv("SHEET_SESSIONS", "shift_sessions").strip()  # состояния смен
 SHEET_CLOSE = os.getenv("SHEET_CLOSE", "close_log").strip()             # закрытие смены (цифры + фото)
+SHEET_SETTINGS = os.getenv("SHEET_SETTINGS", "settings").strip()         # изменяемые настройки бота
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -173,6 +178,15 @@ def require_env():
         problems.append("нужен GOOGLE_SHEETS_CREDENTIALS_FILE или GOOGLE_SHEETS_CREDENTIALS_JSON_B64")
     if CONTROL_GROUP_ID == 0:
         problems.append("CONTROL_GROUP_ID не задан (нужен для одобрения/отчетов)")
+    if not ACCESS_CODE:
+        problems.append("ACCESS_CODE пустой (нужен как начальный код регистрации)")
+    if WEBHOOK_MODE:
+        if not WEBHOOK_SECRET:
+            problems.append("WEBHOOK_SECRET не задан для webhook-режима")
+        elif len(WEBHOOK_SECRET) > 256 or re.fullmatch(r"[A-Za-z0-9_-]+", WEBHOOK_SECRET) is None:
+            problems.append(
+                "WEBHOOK_SECRET: допустимы 1-256 символов A-Z, a-z, 0-9, _ и -"
+            )
     if problems:
         raise RuntimeError("Проблемы с настройкой ENV: " + "; ".join(problems))
 
@@ -314,6 +328,10 @@ CLOSE_HEADER = [
     "note",
 ]
 
+# settings: изменяемые настройки без перезапуска бота
+SETTINGS_HEADER = ["key", "value", "updated_at", "updated_by"]
+SETTING_ACCESS_CODE = "access_code"
+
 # -------------------- BOOTSTRAP SHEETS --------------------
 
 
@@ -324,11 +342,50 @@ def ensure_sheets():
     ensure_sheet_exists(SHEET_DONE)
     ensure_sheet_exists(SHEET_SESSIONS)
     ensure_sheet_exists(SHEET_CLOSE)
+    ensure_sheet_exists(SHEET_SETTINGS)
 
     ensure_header(SHEET_USERS, USERS_HEADER)
     ensure_header(SHEET_DONE, DONE_HEADER)
     ensure_header(SHEET_SESSIONS, SESSIONS_HEADER)
     ensure_header(SHEET_CLOSE, CLOSE_HEADER)
+    ensure_header(SHEET_SETTINGS, SETTINGS_HEADER)
+
+
+# -------------------- SETTINGS --------------------
+
+
+def get_setting_row_and_index(key: str) -> Tuple[Optional[List[str]], Optional[int]]:
+    rows = sheet_get(SHEET_SETTINGS)
+    if not rows:
+        return None, None
+    start = 1 if is_header(rows[0], "key") else 0
+    for i, row in enumerate(rows[start:], start=1 + start):
+        if row and (row[0] or "").strip() == key:
+            return row, i
+    return None, None
+
+
+def get_setting(key: str) -> Optional[str]:
+    row, _idx = get_setting_row_and_index(key)
+    if not row or len(row) < 2:
+        return None
+    value = str(row[1]).strip()
+    return value or None
+
+
+def upsert_setting(key: str, value: str, updated_by: int):
+    ts = now_tz().isoformat(timespec="seconds")
+    row = [key, value, ts, str(updated_by)]
+    _existing, idx = get_setting_row_and_index(key)
+    if idx is None:
+        sheet_append(SHEET_SETTINGS, row)
+    else:
+        sheet_update(f"{SHEET_SETTINGS}!A{idx}:D{idx}", row)
+
+
+def current_access_code() -> str:
+    """Код из settings имеет приоритет; ACCESS_CODE остаётся начальным резервом."""
+    return get_setting(SETTING_ACCESS_CODE) or ACCESS_CODE
 
 
 # -------------------- POINTS --------------------
@@ -814,6 +871,15 @@ def approve_kb(user_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def control_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📋 Команды и их значение",
+            callback_data="CTRL|COMMANDS",
+        )
+    ]])
+
+
 # -------------------- STATE / MODES (per-user in user_data) --------------------
 # Awaiting task photos:
 #   await = "TASK_PHOTO1" / "TASK_PHOTO2"
@@ -936,7 +1002,16 @@ async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reg_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = (update.message.text or "").strip()
-    if code != ACCESS_CODE:
+    try:
+        active_code = current_access_code()
+    except Exception as e:
+        log.error("Не удалось прочитать код регистрации из settings: %s", e)
+        await update.message.reply_text(
+            "Сейчас не получается проверить код. Попробуй ещё раз немного позже."
+        )
+        return REG_CODE
+
+    if not hmac.compare_digest(code.encode("utf-8"), active_code.encode("utf-8")):
         await update.message.reply_text("Код неверный. Попробуй ещё раз:")
         return REG_CODE
 
@@ -980,11 +1055,12 @@ def _is_control_chat(update: Update) -> bool:
 
 async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
 
     if not _is_control_chat(update):
-        await safe_edit(q, "Эти кнопки работают только в группе контроля.")
+        await q.answer("Кнопка работает только в группе контроля.", show_alert=True)
         return
+
+    await q.answer()
 
     try:
         _p, action, uid_s = q.data.split("|", 2)
@@ -1027,8 +1103,43 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- ADMIN COMMANDS (control group only) --------------------
 
 
+CONTROL_COMMANDS_TEXT = (
+    "📋 Команды бота\n\n"
+    "Для сотрудников в личном чате:\n"
+    "/start — регистрация или возврат к текущей смене.\n"
+    "/cancel — отменить начатое заполнение закрытия смены.\n\n"
+    "Для группы контроля:\n"
+    "/panel — показать панель контроля.\n"
+    "/pending — показать сотрудников, ожидающих одобрения.\n"
+    "/block USER_ID — заблокировать сотрудника.\n"
+    "/unblock USER_ID — разблокировать сотрудника.\n"
+    "/totals — итоги за сегодня.\n"
+    "/totals вчера — итоги за вчера.\n"
+    "/totals YYYY-MM-DD — итоги за указанную дату.\n"
+    "/setcode НовыйКод — изменить код регистрации."
+)
+
+
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_control_chat(update):
+        return
+    await update.message.reply_text(
+        "Панель контроля. Это сообщение можно закрепить в группе.",
+        reply_markup=control_panel_kb(),
+    )
+
+
+async def control_commands_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _is_control_chat(update):
+        await q.answer("Кнопка работает только в группе контроля.", show_alert=True)
+        return
+    await q.answer()
+    await q.message.reply_text(CONTROL_COMMANDS_TEXT)
+
+
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat_id != CONTROL_GROUP_ID:
+    if not _is_control_chat(update):
         return
     if not context.args:
         await update.message.reply_text("Использование: /block <user_id>")
@@ -1051,7 +1162,7 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat_id != CONTROL_GROUP_ID:
+    if not _is_control_chat(update):
         return
     if not context.args:
         await update.message.reply_text("Использование: /unblock <user_id>")
@@ -1072,7 +1183,7 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat_id != CONTROL_GROUP_ID:
+    if not _is_control_chat(update):
         return
     rows, has_header = _users_rows()
     if not rows:
@@ -1096,6 +1207,58 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in pending[:40]:
         lines.append(f"• {u.name} — {u.user_id}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_setcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Изменить код регистрации из группы контроля: /setcode НовыйКод."""
+    if not _is_control_chat(update):
+        return
+
+    new_code = " ".join(context.args).strip() if context.args else ""
+    if not new_code:
+        await update.message.reply_text(
+            "Использование: /setcode НовыйКод\n"
+            "Код должен содержать от 6 до 32 символов без пробелов."
+        )
+        return
+
+    valid = (
+        6 <= len(new_code) <= 32
+        and all(ch.isprintable() and not ch.isspace() for ch in new_code)
+    )
+
+    message_deleted = False
+    try:
+        await update.message.delete()
+        message_deleted = True
+    except Exception as e:
+        log.warning("Не смог удалить сообщение /setcode из группы контроля: %s", e)
+
+    if not valid:
+        text = "Код не изменён: нужно от 6 до 32 символов без пробелов."
+        if not message_deleted:
+            text += "\n⚠️ Удалите сообщение с введённым кодом вручную."
+        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+        return
+
+    try:
+        upsert_setting(
+            SETTING_ACCESS_CODE,
+            new_code,
+            update.effective_user.id if update.effective_user else 0,
+        )
+    except Exception as e:
+        log.error("Не удалось изменить код регистрации в settings: %s", e)
+        text = "Не удалось изменить код регистрации. Попробуйте ещё раз позже."
+        if not message_deleted:
+            text += "\n⚠️ Удалите сообщение с введённым кодом вручную."
+        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+        return
+
+    text = "✅ Код регистрации изменён и уже действует."
+    if not message_deleted:
+        text += "\n⚠️ Бот не смог удалить сообщение с кодом — удалите его вручную."
+    await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
 
 
 # -------------------- EMPLOYEE: POINT / OPEN --------------------
@@ -2708,14 +2871,17 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual daily totals in control group: /totals [вчера|yesterday|YYYY-MM-DD]"""
+    if not _is_control_chat(update):
+        await update.effective_message.reply_text(
+            "Команда доступна только в группе контроля."
+        )
+        return
+
     if not ENABLE_DAILY_TOTALS:
         await update.effective_message.reply_text("Итоги отключены.")
         return
 
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    if CONTROL_GROUP_ID and chat_id != CONTROL_GROUP_ID:
-        await update.effective_message.reply_text("Команда доступна только в группе контроля.")
-        return
 
     d = day_key()
     if getattr(context, "args", None):
@@ -2773,10 +2939,13 @@ def build_app() -> Application:
 
     # Admin commands & buttons
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^ADM\|"))
+    app.add_handler(CallbackQueryHandler(control_commands_cb, pattern=r"^CTRL\|COMMANDS$"))
     app.add_handler(CommandHandler("block", cmd_block))
+    app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("totals", cmd_totals))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("setcode", cmd_setcode))
 
     # Employee callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
@@ -2888,6 +3057,13 @@ def main():
             return web.Response(text="OK")
 
         async def webhook_handler(request: web.Request) -> web.Response:
+            received_secret = request.headers.get(
+                "X-Telegram-Bot-Api-Secret-Token", ""
+            )
+            if not hmac.compare_digest(received_secret, WEBHOOK_SECRET):
+                log.warning("Отклонён webhook-запрос с неверным секретом")
+                return web.Response(status=403, text="forbidden")
+
             try:
                 data = await request.json()
             except Exception:
@@ -2911,6 +3087,7 @@ def main():
             url = f"{WEBHOOK_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
             await tg_app.bot.set_webhook(
                 url=url,
+                secret_token=WEBHOOK_SECRET,
                 drop_pending_updates=True,
                 allowed_updates=Update.ALL_TYPES,
             )
