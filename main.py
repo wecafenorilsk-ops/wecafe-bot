@@ -100,6 +100,14 @@ ENABLE_DAILY_TOTALS = os.getenv("ENABLE_DAILY_TOTALS", "1").strip() != "0"
 DAILY_TOTALS_HOUR = int(os.getenv("DAILY_TOTALS_HOUR", "23").strip() or "23")
 DAILY_TOTALS_MINUTE = int(os.getenv("DAILY_TOTALS_MINUTE", "50").strip() or "50")
 
+# Автоочистка логов Google Sheets. Первый запуск безопасный: только проверка.
+ENABLE_AUTO_CLEANUP = os.getenv("ENABLE_AUTO_CLEANUP", "1").strip() != "0"
+AUTO_CLEANUP_RETENTION_DAYS = int(os.getenv("AUTO_CLEANUP_RETENTION_DAYS", "183").strip() or "183")
+AUTO_CLEANUP_DAY = int(os.getenv("AUTO_CLEANUP_DAY", "1").strip() or "1")
+AUTO_CLEANUP_HOUR = int(os.getenv("AUTO_CLEANUP_HOUR", "4").strip() or "4")
+AUTO_CLEANUP_MINUTE = int(os.getenv("AUTO_CLEANUP_MINUTE", "0").strip() or "0")
+AUTO_CLEANUP_DRY_RUN = os.getenv("AUTO_CLEANUP_DRY_RUN", "1").strip() != "0"
+
 # Листы (сохраняем “дух” текущего бота)
 SHEET_SCHEDULE = os.getenv("SHEET_SCHEDULE", "cleaning_schedule").strip()
 SHEET_USERS = os.getenv("SHEET_USERS", "users").strip()
@@ -180,6 +188,14 @@ def require_env():
         problems.append("CONTROL_GROUP_ID не задан (нужен для одобрения/отчетов)")
     if not ACCESS_CODE:
         problems.append("ACCESS_CODE пустой (нужен как начальный код регистрации)")
+    if not 30 <= AUTO_CLEANUP_RETENTION_DAYS <= 3650:
+        problems.append("AUTO_CLEANUP_RETENTION_DAYS должен быть от 30 до 3650")
+    if not 1 <= AUTO_CLEANUP_DAY <= 28:
+        problems.append("AUTO_CLEANUP_DAY должен быть от 1 до 28")
+    if not 0 <= AUTO_CLEANUP_HOUR <= 23:
+        problems.append("AUTO_CLEANUP_HOUR должен быть от 0 до 23")
+    if not 0 <= AUTO_CLEANUP_MINUTE <= 59:
+        problems.append("AUTO_CLEANUP_MINUTE должен быть от 0 до 59")
     if WEBHOOK_MODE:
         if not WEBHOOK_SECRET:
             problems.append("WEBHOOK_SECRET не задан для webhook-режима")
@@ -275,6 +291,18 @@ def get_sheet_titles() -> List[str]:
         fields="sheets(properties(title))",
     ).execute()
     return [s["properties"]["title"] for s in meta.get("sheets", [])]
+
+
+def get_sheet_ids_by_title() -> Dict[str, int]:
+    service = sheets_service()
+    meta = service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    return {
+        s["properties"]["title"]: int(s["properties"]["sheetId"])
+        for s in meta.get("sheets", [])
+    }
 
 
 def ensure_sheet_exists(sheet_title: str):
@@ -386,6 +414,123 @@ def upsert_setting(key: str, value: str, updated_by: int):
 def current_access_code() -> str:
     """Код из settings имеет приоритет; ACCESS_CODE остаётся начальным резервом."""
     return get_setting(SETTING_ACCESS_CODE) or ACCESS_CODE
+
+
+# -------------------- GOOGLE SHEETS RETENTION --------------------
+
+
+def cleanup_cutoff_date() -> date:
+    return now_tz().date() - timedelta(days=AUTO_CLEANUP_RETENTION_DAYS)
+
+
+def _contiguous_row_ranges(row_indexes: List[int]) -> List[Tuple[int, int]]:
+    """Собирает zero-based номера строк в диапазоны [start, end)."""
+    if not row_indexes:
+        return []
+    indexes = sorted(set(row_indexes))
+    ranges: List[Tuple[int, int]] = []
+    start = previous = indexes[0]
+    for idx in indexes[1:]:
+        if idx == previous + 1:
+            previous = idx
+            continue
+        ranges.append((start, previous + 1))
+        start = previous = idx
+    ranges.append((start, previous + 1))
+    return ranges
+
+
+def build_cleanup_plan(cutoff: date) -> List[Dict[str, Any]]:
+    """Находит строки с корректной датой в колонке B, которые старше cutoff."""
+    sheet_ids = get_sheet_ids_by_title()
+    plan: List[Dict[str, Any]] = []
+    for title in (SHEET_DONE, SHEET_SESSIONS, SHEET_CLOSE):
+        sheet_id = sheet_ids.get(title)
+        if sheet_id is None:
+            raise RuntimeError(f"Лист {title} не найден")
+
+        rows = sheet_get(f"{title}!B2:B")
+        old_row_indexes: List[int] = []
+        invalid_dates = 0
+        for zero_based_row, row in enumerate(rows, start=1):
+            raw = str(row[0]).strip() if row else ""
+            if not raw:
+                continue
+            try:
+                row_day = date.fromisoformat(raw)
+            except Exception:
+                invalid_dates += 1
+                continue
+            if row_day < cutoff:
+                old_row_indexes.append(zero_based_row)
+
+        plan.append({
+            "title": title,
+            "sheet_id": sheet_id,
+            "row_indexes": old_row_indexes,
+            "invalid_dates": invalid_dates,
+        })
+    return plan
+
+
+def execute_cleanup_plan(plan: List[Dict[str, Any]]) -> int:
+    """Удаляет найденные строки снизу вверх одной атомарной batchUpdate-операцией."""
+    requests: List[Dict[str, Any]] = []
+    for item in plan:
+        ranges = _contiguous_row_ranges(item["row_indexes"])
+        for start_index, end_index in reversed(ranges):
+            requests.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": item["sheet_id"],
+                        "dimension": "ROWS",
+                        "startIndex": start_index,
+                        "endIndex": end_index,
+                    }
+                }
+            })
+
+    if not requests:
+        return 0
+
+    sheets_service().spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": requests},
+    ).execute()
+    return sum(len(item["row_indexes"]) for item in plan)
+
+
+def format_cleanup_report(
+    plan: List[Dict[str, Any]],
+    cutoff: date,
+    deleted: bool,
+    automatic: bool = False,
+) -> str:
+    if deleted:
+        title = "🧹 Автоочистка Google Sheets завершена"
+    elif automatic:
+        title = "🧹 Автоочистка Google Sheets — проверочный режим"
+    else:
+        title = "🧹 Предварительная проверка автоочистки"
+
+    lines = [title, "", f"Будут храниться данные начиная с {cutoff.isoformat()}.", ""]
+    total = 0
+    invalid_total = 0
+    for item in plan:
+        count = len(item["row_indexes"])
+        total += count
+        invalid_total += int(item["invalid_dates"])
+        verb = "Удалено" if deleted else "Будет удалено"
+        lines.append(f"{verb} из {item['title']}: {count} строк")
+
+    lines.extend(["", f"Всего: {total} строк"])
+    if invalid_total:
+        lines.append(
+            f"⚠️ Пропущено строк с непонятной датой: {invalid_total}. Они не удаляются."
+        )
+    if not deleted:
+        lines.append("Данные не удалялись.")
+    return "\n".join(lines)
 
 
 # -------------------- POINTS --------------------
@@ -770,7 +915,7 @@ def list_open_sessions() -> List[Session]:
 
 
 def user_open_context(user_id: int) -> Tuple[Optional[Session], Optional[str]]:
-    """Возвращает (session, role) где role: 'FULL', 'HALF1', 'HALF2'."""
+    """Возвращает текущую сессию и роль сотрудника, включая ожидание передачи."""
     d = day_key()
     sessions = list_open_sessions()
     for s in sessions:
@@ -781,9 +926,44 @@ def user_open_context(user_id: int) -> Tuple[Optional[Session], Optional[str]]:
         if s.mode == "HALF":
             if s.state == "OPEN1" and s.user1_id == str(user_id):
                 return s, "HALF1"
+            if s.state == "WAIT_ACCEPT" and s.user1_id == str(user_id):
+                return s, "HALF1_WAIT"
+            if s.state == "WAIT_ACCEPT" and s.user2_id == str(user_id):
+                return s, "HALF2_WAIT"
             if s.state == "OPEN2" and s.user2_id == str(user_id):
                 return s, "HALF2"
     return None, None
+
+
+def user_is_busy(user_id: int, exclude_session_id: str = "") -> bool:
+    """Сотрудник уже работает или участвует в ожидающей передаче сегодня."""
+    uid = str(user_id)
+    d = day_key()
+    for s in list_open_sessions():
+        if s.day != d or (exclude_session_id and s.session_id == exclude_session_id):
+            continue
+        if s.mode == "FULL" and s.state == "OPEN_FULL" and s.user1_id == uid:
+            return True
+        if s.mode != "HALF":
+            continue
+        if s.state == "OPEN1" and s.user1_id == uid:
+            return True
+        if s.state == "WAIT_ACCEPT" and uid in (s.user1_id, s.user2_id):
+            return True
+        if s.state == "OPEN2" and s.user2_id == uid:
+            return True
+    return False
+
+
+def rollback_pending_transfer(sess: Session):
+    """Вернуть половину смены первому сотруднику и очистить приглашение второго."""
+    sess.state = "OPEN1"
+    sess.user1_end = ""
+    sess.user2_id = ""
+    sess.user2_name = ""
+    sess.user2_start = ""
+    sess.user2_end = ""
+    upsert_session(sess)
 
 
 # -------------------- WORK HOURS / CLOSE BUTTON --------------------
@@ -838,7 +1018,27 @@ def open_choice_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def shift_kb(role: str, point: str) -> InlineKeyboardMarkup:
+def transfer_invite_kb(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{session_id}")],
+        [InlineKeyboardButton("❌ Не могу принять", callback_data=f"DECLINE|{session_id}")],
+    ])
+
+
+def control_cancel_transfer_kb(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "❌ Отменить передачу",
+            callback_data=f"CTRL|CANCEL_TRANSFER|{session_id}",
+        )
+    ]])
+
+
+def shift_kb(role: str, point: str, session_id: str = "") -> InlineKeyboardMarkup:
+    if role == "HALF2_WAIT":
+        sid = session_id or make_session_id(day_key(), point)
+        return transfer_invite_kb(sid)
+
     rows = [
         [InlineKeyboardButton("🧾 План задач", callback_data="PLAN")],
         [InlineKeyboardButton("✅ Отметить выполненную задачу", callback_data="MARK")],
@@ -846,6 +1046,13 @@ def shift_kb(role: str, point: str) -> InlineKeyboardMarkup:
     ]
     if role == "HALF1":
         rows.append([InlineKeyboardButton("🔁 Передать смену", callback_data="TRANSFER")])
+    if role == "HALF1_WAIT":
+        rows.append([
+            InlineKeyboardButton(
+                "↩️ Отменить передачу",
+                callback_data="TRANSFER_CANCEL_SELF",
+            )
+        ])
     if role in ("FULL", "HALF1", "HALF2"):
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE")])
     return InlineKeyboardMarkup(rows)
@@ -974,7 +1181,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sess, role = user_open_context(uid)
         if sess and role:
             point = normalize_point(sess.point)
-            await update.message.reply_text(text + f"\n\nСмена уже открыта на точке: {point}", reply_markup=shift_kb(role, point))
+            if role == "HALF1_WAIT":
+                message = (
+                    text + f"\n\nОжидается принятие смены на точке: {point}. "
+                    "Пока смена остаётся за тобой."
+                )
+            elif role == "HALF2_WAIT":
+                message = text + f"\n\nТебе передают смену на точке: {point}."
+            else:
+                message = text + f"\n\nСмена уже открыта на точке: {point}"
+            await update.message.reply_text(
+                message,
+                reply_markup=shift_kb(role, point, sess.session_id),
+            )
             return ConversationHandler.END
         if not u.point:
             await update.message.reply_text(text + "\n\nВыбери точку:", reply_markup=after_approved_kb())
@@ -1116,7 +1335,8 @@ CONTROL_COMMANDS_TEXT = (
     "/totals — итоги за сегодня.\n"
     "/totals вчера — итоги за вчера.\n"
     "/totals YYYY-MM-DD — итоги за указанную дату.\n"
-    "/setcode НовыйКод — изменить код регистрации."
+    "/setcode НовыйКод — изменить код регистрации.\n"
+    "/cleanup_preview — проверить, какие старые строки будут удалены."
 )
 
 
@@ -1136,6 +1356,23 @@ async def control_commands_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await q.answer()
     await q.message.reply_text(CONTROL_COMMANDS_TEXT)
+
+
+async def cmd_cleanup_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_control_chat(update):
+        return
+    cutoff = cleanup_cutoff_date()
+    try:
+        plan = build_cleanup_plan(cutoff)
+    except Exception as e:
+        log.error("Не удалось подготовить проверку автоочистки: %s", e)
+        await update.message.reply_text(
+            "Не удалось проверить таблицу для автоочистки. Попробуйте позже."
+        )
+        return
+    await update.message.reply_text(
+        format_cleanup_report(plan, cutoff, deleted=False, automatic=False)
+    )
 
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1683,7 +1920,7 @@ def assigned_tasks_for_user(sess: Session, role: str, point: str) -> Tuple[List[
     tasks = load_tasks_for_today(point)
     if role == "FULL":
         return tasks, "FULL"
-    if role == "HALF1":
+    if role in ("HALF1", "HALF1_WAIT"):
         split_index = int(sess.split_index or "0")
         return tasks[:split_index], "HALF1"
     if role == "HALF2":
@@ -2021,12 +2258,14 @@ async def transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     point = normalize_point(sess.point)
 
-    # список активных сотрудников на этой точке
-    users = [x for x in list_active_users_all() if x.user_id != u.user_id]
+    # Все активные сотрудники, кроме уже работающих или ожидающих другую передачу.
+    users = [
+        x for x in list_active_users_all()
+        if x.user_id != u.user_id and not user_is_busy(x.user_id)
+    ]
     if not users:
-        await safe_edit(q, 
-            "Нет активных сотрудников на этой точке для передачи.\n"
-            "Пусть второй сотрудник пройдёт регистрацию и выберет эту же точку.",
+        await safe_edit(q,
+            "Сейчас нет свободных активных сотрудников для передачи смены.",
             reply_markup=shift_kb(role, point),
         )
         return
@@ -2065,6 +2304,13 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u2 or u2.status != STATUS_ACTIVE:
         await safe_edit(q, "Этот сотрудник сейчас не активен.", reply_markup=shift_kb(role, point))
         return
+    if user_is_busy(u2.user_id):
+        await safe_edit(
+            q,
+            "Этот сотрудник уже занят другой сменой или передачей. Выбери другого.",
+            reply_markup=shift_kb(role, point),
+        )
+        return
 
     # проверка косяков по задачам первой половины
     tasks_all = load_tasks_for_today(point)
@@ -2088,10 +2334,10 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-    # фиксируем конец у user1 и ставим ожидание
+    # Ставим ожидание. Окончание первой половины фиксируется только при принятии.
     ts = now_tz().isoformat(timespec="seconds")
     sess.state = "WAIT_ACCEPT"
-    sess.user1_end = ts
+    sess.user1_end = ""
     sess.user2_id = str(u2.user_id)
     sess.user2_name = u2.name
     upsert_session(sess)
@@ -2100,29 +2346,203 @@ async def pick_user2_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=u2.user_id,
-            text=f"Тебе передают смену на точке: {point}\nНажми «Принять смену». (Точку выбирать не нужно)",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{sess.session_id}")]
-            ]),
+            text=(
+                f"Тебе передают смену на точке: {point}\n"
+                "Прими смену или сообщи, что не можешь её принять. "
+                "Точку выбирать не нужно."
+            ),
+            reply_markup=transfer_invite_kb(sess.session_id),
         )
     except Exception as e:
         log.warning("Не смог отправить accept user2: %s", e)
+        rollback_pending_transfer(sess)
+        await safe_edit(
+            q,
+            "Не удалось отправить приглашение сотруднику. Передача не начата.",
+            reply_markup=shift_kb("HALF1", point),
+        )
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=CONTROL_GROUP_ID,
+            text=format_control(
+                "🔁 Передача смены запрошена",
+                u.name,
+                u.user_id,
+                point=point,
+                details=[f"Кому: {u2.name} ({u2.user_id})", f"Время запроса: {ts}"],
+            ),
+            reply_markup=control_cancel_transfer_kb(sess.session_id),
+        )
+    except Exception as e:
+        log.warning("Не смог отправить кнопку отмены передачи в контроль: %s", e)
+
+    await safe_edit(q,
+        "Запрос на передачу отправлен ✅\n"
+        "Пока второй сотрудник не принял смену, она остаётся за тобой.",
+        reply_markup=shift_kb("HALF1_WAIT", point, sess.session_id),
+    )
+
+
+async def cancel_transfer_self_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    sess, role = user_open_context(u.user_id)
+    if not sess or role != "HALF1_WAIT" or sess.state != "WAIT_ACCEPT":
+        await safe_edit(q, "Активной передачи смены уже нет.")
+        return
+
+    point = normalize_point(sess.point)
+    user2_id = int(sess.user2_id) if sess.user2_id else 0
+    user2_name = sess.user2_name
+    rollback_pending_transfer(sess)
+
+    if user2_id:
+        try:
+            await context.bot.send_message(
+                chat_id=user2_id,
+                text=f"Передача смены на точке {point} отменена первым сотрудником.",
+            )
+        except Exception as e:
+            log.warning("Не смог уведомить второго сотрудника об отмене: %s", e)
 
     await report_to_control(
         context,
         format_control(
-            "🔁 Передача смены запрошена",
+            "↩️ Передача смены отменена первым сотрудником",
             u.name,
             u.user_id,
             point=point,
-            details=[f"Кому: {u2.name} ({u2.user_id})", f"Время: {ts}"],
+            details=[f"Приглашался: {user2_name} ({user2_id})"],
         ),
     )
+    await safe_edit(
+        q,
+        "Передача отменена. Половина смены снова закреплена за тобой.",
+        reply_markup=shift_kb("HALF1", point),
+    )
 
-    await safe_edit(q, 
-        "Смену передал ✅\n"
-        "Второй сотрудник должен нажать «Принять смену».",
-        reply_markup=open_choice_kb(),
+
+async def decline_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    try:
+        _prefix, session_id = q.data.split("|", 1)
+        d, point = session_id.split("|", 1)
+    except Exception:
+        await safe_edit(q, "Некорректная команда.")
+        return
+
+    sess, _idx = get_session(d, point)
+    if (
+        not sess
+        or sess.session_id != session_id
+        or sess.mode != "HALF"
+        or sess.state != "WAIT_ACCEPT"
+        or sess.user2_id != str(u.user_id)
+    ):
+        await safe_edit(q, "Это приглашение уже недействительно.")
+        return
+
+    point = normalize_point(sess.point)
+    user1_id = int(sess.user1_id) if sess.user1_id else 0
+    user1_name = sess.user1_name
+    rollback_pending_transfer(sess)
+
+    if user1_id:
+        try:
+            await context.bot.send_message(
+                chat_id=user1_id,
+                text=(
+                    f"{u.name} не может принять смену на точке {point}.\n"
+                    "Смена остаётся за тобой; можно выбрать другого сотрудника."
+                ),
+                reply_markup=shift_kb("HALF1", point),
+            )
+        except Exception as e:
+            log.warning("Не смог уведомить первого сотрудника об отказе: %s", e)
+
+    await report_to_control(
+        context,
+        format_control(
+            "❌ Второй сотрудник отказался принять смену",
+            u.name,
+            u.user_id,
+            point=point,
+            details=[f"Смена возвращена: {user1_name} ({user1_id})"],
+        ),
+    )
+    await safe_edit(q, "Отказ принят. Смена возвращена первому сотруднику.")
+
+
+async def control_cancel_transfer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _is_control_chat(update):
+        await q.answer("Кнопка работает только в группе контроля.", show_alert=True)
+        return
+    await q.answer()
+
+    try:
+        _prefix, _action, session_id = q.data.split("|", 2)
+        d, point = session_id.split("|", 1)
+    except Exception:
+        await safe_edit(q, "Некорректная команда отмены передачи.")
+        return
+
+    sess, _idx = get_session(d, point)
+    if (
+        not sess
+        or sess.session_id != session_id
+        or sess.mode != "HALF"
+        or sess.state != "WAIT_ACCEPT"
+    ):
+        await safe_edit(q, "Передача уже принята, отменена или недействительна.")
+        return
+
+    point = normalize_point(sess.point)
+    user1_id = int(sess.user1_id) if sess.user1_id else 0
+    user2_id = int(sess.user2_id) if sess.user2_id else 0
+    user1_name = sess.user1_name
+    user2_name = sess.user2_name
+    rollback_pending_transfer(sess)
+
+    if user1_id:
+        try:
+            await context.bot.send_message(
+                chat_id=user1_id,
+                text=(
+                    f"Руководитель отменил передачу смены на точке {point}.\n"
+                    "Смена остаётся за тобой."
+                ),
+                reply_markup=shift_kb("HALF1", point),
+            )
+        except Exception as e:
+            log.warning("Не смог уведомить первого сотрудника об отмене руководителем: %s", e)
+
+    if user2_id:
+        try:
+            await context.bot.send_message(
+                chat_id=user2_id,
+                text=f"Руководитель отменил передачу смены на точке {point}.",
+            )
+        except Exception as e:
+            log.warning("Не смог уведомить второго сотрудника об отмене руководителем: %s", e)
+
+    await safe_edit(
+        q,
+        "↩️ Передача смены отменена руководителем\n"
+        f"Точка: {point}\n"
+        f"Смена возвращена: {user1_name} ({user1_id})\n"
+        f"Приглашался: {user2_name} ({user2_id})",
     )
 
 
@@ -2157,6 +2577,9 @@ async def accept_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sess.user2_id != str(u.user_id):
         await safe_edit(q, "Эта смена адресована другому сотруднику.")
         return
+    if user_is_busy(u.user_id, exclude_session_id=sess.session_id):
+        await safe_edit(q, "У тебя уже есть другая активная смена. Принять эту нельзя.")
+        return
 
 
     # Автоматически привязываем сотрудника ко входящей точке смены
@@ -2164,8 +2587,22 @@ async def accept_shift_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ts = now_tz().isoformat(timespec="seconds")
     sess.state = "OPEN2"
+    sess.user1_end = ts
     sess.user2_start = ts
     upsert_session(sess)
+
+    if sess.user1_id:
+        try:
+            await context.bot.send_message(
+                chat_id=int(sess.user1_id),
+                text=(
+                    f"{u.name} принял смену на точке {normalize_point(sess.point)} ✅\n"
+                    f"Твоя половина смены завершена: {ts}"
+                ),
+                reply_markup=after_approved_kb(),
+            )
+        except Exception as e:
+            log.warning("Не смог уведомить первого сотрудника о принятии смены: %s", e)
 
     await report_to_control(
         context,
@@ -2869,6 +3306,42 @@ async def daily_totals_job(context: ContextTypes.DEFAULT_TYPE):
         log.warning("Не смог отправить ежедневные итоги: %s", e)
 
 
+async def auto_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_AUTO_CLEANUP or CONTROL_GROUP_ID == 0:
+        return
+    if now_tz().day != AUTO_CLEANUP_DAY:
+        return
+
+    cutoff = cleanup_cutoff_date()
+    try:
+        plan = build_cleanup_plan(cutoff)
+        if AUTO_CLEANUP_DRY_RUN:
+            text = format_cleanup_report(
+                plan,
+                cutoff,
+                deleted=False,
+                automatic=True,
+            )
+        else:
+            execute_cleanup_plan(plan)
+            text = format_cleanup_report(
+                plan,
+                cutoff,
+                deleted=True,
+                automatic=True,
+            )
+        await context.bot.send_message(chat_id=CONTROL_GROUP_ID, text=text)
+    except Exception as e:
+        log.exception("Ошибка автоматической очистки Google Sheets: %s", e)
+        try:
+            await context.bot.send_message(
+                chat_id=CONTROL_GROUP_ID,
+                text="⚠️ Автоочистка Google Sheets не выполнена из-за ошибки.",
+            )
+        except Exception:
+            pass
+
+
 async def cmd_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual daily totals in control group: /totals [вчера|yesterday|YYYY-MM-DD]"""
     if not _is_control_chat(update):
@@ -2940,12 +3413,14 @@ def build_app() -> Application:
     # Admin commands & buttons
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^ADM\|"))
     app.add_handler(CallbackQueryHandler(control_commands_cb, pattern=r"^CTRL\|COMMANDS$"))
+    app.add_handler(CallbackQueryHandler(control_cancel_transfer_cb, pattern=r"^CTRL\|CANCEL_TRANSFER\|"))
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("totals", cmd_totals))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("setcode", cmd_setcode))
+    app.add_handler(CommandHandler("cleanup_preview", cmd_cleanup_preview))
 
     # Employee callbacks
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
@@ -2984,8 +3459,10 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_text_message), group=1)
 
     app.add_handler(CallbackQueryHandler(transfer_cb, pattern=r"^TRANSFER$"))
+    app.add_handler(CallbackQueryHandler(cancel_transfer_self_cb, pattern=r"^TRANSFER_CANCEL_SELF$"))
     app.add_handler(CallbackQueryHandler(pick_user2_cb, pattern=r"^U2\|\d+$"))
     app.add_handler(CallbackQueryHandler(accept_shift_cb, pattern=r"^ACCEPT\|"))
+    app.add_handler(CallbackQueryHandler(decline_shift_cb, pattern=r"^DECLINE\|"))
 
     app.add_handler(CallbackQueryHandler(back_main_cb, pattern=r"^BACK_MAIN$"))
     app.add_handler(CallbackQueryHandler(back_shift_cb, pattern=r"^BACK_SHIFT$"))
@@ -3030,6 +3507,32 @@ def build_app() -> Application:
             log.warning("Daily totals schedule failed: %s", e)
     else:
         log.info("Daily totals disabled or JobQueue not available")
+
+    # Проверка/очистка старых строк первого числа каждого месяца.
+    if ENABLE_AUTO_CLEANUP and app.job_queue:
+        try:
+            cleanup_time = time(
+                AUTO_CLEANUP_HOUR,
+                AUTO_CLEANUP_MINUTE,
+                tzinfo=_tz,
+            )
+            app.job_queue.run_daily(
+                auto_cleanup_job,
+                time=cleanup_time,
+                name="google_sheets_auto_cleanup",
+            )
+            log.info(
+                "Auto cleanup enabled: day=%s time=%02d:%02d retention=%s dry_run=%s",
+                AUTO_CLEANUP_DAY,
+                AUTO_CLEANUP_HOUR,
+                AUTO_CLEANUP_MINUTE,
+                AUTO_CLEANUP_RETENTION_DAYS,
+                AUTO_CLEANUP_DRY_RUN,
+            )
+        except Exception as e:
+            log.warning("Auto cleanup schedule failed: %s", e)
+    else:
+        log.info("Auto cleanup disabled or JobQueue not available")
 
     return app
 
