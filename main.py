@@ -997,6 +997,117 @@ def in_work_hours(point: str) -> bool:
 # -------------------- UI BUILDERS --------------------
 
 
+EMPLOYEE_INSTRUCTIONS_TEXT = """📖 ИНСТРУКЦИЯ ДЛЯ СОТРУДНИКОВ
+
+1. Регистрация
+
+• Отправь команду /start.
+• Напиши своё имя.
+• Введи код доступа, полученный у руководителя.
+• Дождись одобрения заявки.
+
+После одобрения бот сообщит об этом отдельным сообщением.
+
+2. Выбор точки
+
+• Нажми «📍 Сменить точку».
+• Выбери точку, на которой работаешь.
+
+Если ошибся при выборе, но смену ещё не открыл, отправь /start и выбери точку заново.
+
+После открытия смены изменить точку нельзя.
+
+3. Открытие смены
+
+Выбери подходящий вариант:
+
+• «🔓 Открыть смену (полная)» — если работаешь всю смену.
+• «⏱️ Открыть пол смены» — если потом передашь смену другому сотруднику.
+
+Для открытия смены бот попросит:
+
+1. Написать список десертов в витрине и сроки их годности.
+2. Отправить фото витрины.
+3. Отправить фото макаронс со сроками годности и вкусами.
+
+Отправляй информацию по порядку, только после запроса бота.
+
+4. Задачи во время смены
+
+«🧾 План задач» — показывает твои задачи на сегодня.
+
+«✅ Отметить выполненную задачу»:
+
+1. Выбери выполненную задачу.
+2. Отправь первое фото — оно обязательно.
+3. Отправь второе фото или нажми «Пропустить фото 2».
+
+Выполненная задача будет отмечена значком ✅.
+
+Если задачи долго не отмечаются, бот может прислать напоминание.
+
+5. Связь с руководителем
+
+Нажми «🤝 Красавчик помоги», если нужно передать информацию в группу контроля.
+
+1. Сначала напиши текст одним сообщением.
+2. При необходимости добавь до четырёх фотографий.
+3. Нажми «✅ Отправить».
+
+Чтобы не отправлять сообщение, нажми «❌ Отмена».
+
+6. Передача половины смены
+
+Передавать смену может первый сотрудник, открывший половину смены.
+
+1. Выполни задачи своей части смены.
+2. Нажми «🔁 Передать смену».
+3. Выбери свободного сотрудника из списка.
+
+Пока второй сотрудник не принял смену, она остаётся за первым сотрудником.
+
+Первый сотрудник может нажать «↩️ Отменить передачу».
+
+Второй сотрудник получает две кнопки:
+
+• «✅ Принять смену» — смена и нужная точка закрепятся автоматически.
+• «❌ Не могу принять» — смена вернётся первому сотруднику.
+
+Выбирать точку перед принятием переданной смены не нужно.
+
+7. Закрытие смены
+
+Полную смену закрывает сотрудник полной смены. При работе по половинам итоговое закрытие выполняет второй сотрудник после принятия смены.
+
+Не закрывай смену раньше окончания работы точки.
+
+Нажми «🔒 Закрыть смену» и по порядку введи:
+
+1. Сумму наличных в начале смены — внесение.
+2. Продажи по безналу.
+3. Продажи по наличным.
+4. Сумму возвратов. Если возвратов не было — введи 0.
+5. Первое фото чека закрытия.
+6. Второе фото чека закрытия.
+7. Четыре фото убранного рабочего места и инвентаря — каждое отдельным сообщением.
+
+После четвёртого фото бот закроет смену и отправит отчёт в группу контроля.
+
+Если ошибся при заполнении закрытия, отправь /cancel и начни закрытие заново.
+
+8. Полезные команды
+
+/start — регистрация или возврат к текущему меню и открытой смене.
+
+/cancel — отмена начатого заполнения закрытия смены.
+
+Важно: не отправляй отчёты и фотографии заранее. Дождись, когда бот сам попросит нужную информацию."""
+
+
+def instruction_button_row() -> List[InlineKeyboardButton]:
+    return [InlineKeyboardButton("📖 Инструкция", callback_data="INSTRUCTION")]
+
+
 def kb_single(label: str, cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cb)]])
 
@@ -1007,14 +1118,18 @@ def points_kb(points: List[str], prefix: str = "POINT") -> InlineKeyboardMarkup:
 
 
 def after_approved_kb() -> InlineKeyboardMarkup:
-    return kb_single("📍 Сменить точку", "CHOOSE_POINT")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📍 Сменить точку", callback_data="CHOOSE_POINT")],
+        instruction_button_row(),
+    ])
 
 
 def open_choice_kb() -> InlineKeyboardMarkup:
-    # Строгая логика: после выбора точки — только 2 кнопки открытия смены
+    # После выбора точки — варианты открытия смены и инструкция
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔓 Открыть смену (полная)", callback_data="OPEN|FULL")],
         [InlineKeyboardButton("⏱️ Открыть пол смены", callback_data="OPEN|HALF")],
+        instruction_button_row(),
     ])
 
 
@@ -1022,6 +1137,7 @@ def transfer_invite_kb(session_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Принять смену", callback_data=f"ACCEPT|{session_id}")],
         [InlineKeyboardButton("❌ Не могу принять", callback_data=f"DECLINE|{session_id}")],
+        instruction_button_row(),
     ])
 
 
@@ -1053,8 +1169,9 @@ def shift_kb(role: str, point: str, session_id: str = "") -> InlineKeyboardMarku
                 callback_data="TRANSFER_CANCEL_SELF",
             )
         ])
-    if role in ("FULL", "HALF1", "HALF2"):
+    if role in ("FULL", "HALF2") and can_close_now(point):
         rows.append([InlineKeyboardButton("🔒 Закрыть смену", callback_data="CLOSE")])
+    rows.append(instruction_button_row())
     return InlineKeyboardMarkup(rows)
 
 
@@ -1158,6 +1275,18 @@ async def guard_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await safe_edit(update.callback_query, "Заявка на одобрении. Ждём 🙂")
         return None
     return u
+
+
+async def instruction_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = await guard_employee(update, context)
+    if not u:
+        return
+
+    # Отправляем отдельным сообщением, чтобы рабочие кнопки под текущим меню сохранились.
+    await q.message.reply_text(EMPLOYEE_INSTRUCTIONS_TEXT)
 
 
 # -------------------- HANDLERS: START / REGISTER --------------------
@@ -2639,8 +2768,21 @@ async def close_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     point = normalize_point(sess.point)
 
-    if role not in ("FULL", "HALF1", "HALF2"):
-        await safe_edit(q, "Закрытие смены доступно только для полной смены или сотрудников пол-смены.")
+    if role not in ("FULL", "HALF2"):
+        await safe_edit(
+            q,
+            "Первый сотрудник пол-смены не закрывает смену. Передай её второму сотруднику.",
+            reply_markup=shift_kb(role, point, sess.session_id),
+        )
+        return ConversationHandler.END
+
+    if not can_close_now(point):
+        _start, end = point_hours(point)
+        await safe_edit(
+            q,
+            f"Закрытие смены на точке {point} доступно после {end.strftime('%H:%M')}.",
+            reply_markup=shift_kb(role, point, sess.session_id),
+        )
         return ConversationHandler.END
 
     # подготовим контекст закрытия
@@ -2861,7 +3003,17 @@ async def close_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("close", None)
-    await update.message.reply_text("Ок, отменил закрытие смены.", reply_markup=open_choice_kb())
+    sess, role = user_open_context(update.effective_user.id)
+    if sess and role:
+        await update.message.reply_text(
+            "Ок, отменил закрытие смены.",
+            reply_markup=shift_kb(role, normalize_point(sess.point), sess.session_id),
+        )
+    else:
+        await update.message.reply_text(
+            "Ок, отменил закрытие смены.",
+            reply_markup=after_approved_kb(),
+        )
     return ConversationHandler.END
 
 
@@ -3423,6 +3575,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cleanup_preview", cmd_cleanup_preview))
 
     # Employee callbacks
+    app.add_handler(CallbackQueryHandler(instruction_cb, pattern=r"^INSTRUCTION$"))
     app.add_handler(CallbackQueryHandler(choose_point_cb, pattern=r"^CHOOSE_POINT$"))
     app.add_handler(CallbackQueryHandler(point_pick_cb, pattern=r"^POINT\|\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_point_cb, pattern=r"^BACK_TO_POINT$"))
